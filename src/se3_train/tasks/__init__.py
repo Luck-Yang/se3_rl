@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from . import (
     flat,
+    flat_ly,
     jump_finetune,
     jump_pretrain,
     recovery_discovery,
@@ -21,6 +22,7 @@ def register_all_tasks() -> None:
     """注册当前包内全部训练任务。"""
     rough.register()
     flat.register()
+    flat_ly.register()
     recovery_discovery.register()
     stair.register()
     jump_pretrain.register()

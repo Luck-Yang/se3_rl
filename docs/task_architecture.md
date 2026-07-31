@@ -10,6 +10,7 @@
 | --- | --- | --- |
 | `rough/` | `SE3-WheelLegged-Rough` | 崎岖地形行走任务 |
 | `flat/` | `SE3-WheelLegged-Flat-GRU` | 平地行走 GRU 基模 |
+| `flat_ly/` | `SE3-WheelLegged-Flat-LY-GRU` | 基于 flat、奖励留空的完整训练流程学习任务 |
 | `recovery/` | `SE3-WheelLegged-Recovery-GRU` | 倒地自启任务，从平地 GRU checkpoint warm start |
 | `recovery_discovery/` | `SE3-WheelLegged-Recovery-Discovery-GRU` | 倒地自启 discovery 阶段，从 recovery 配置派生 |
 | `recovery_finetune/` | `SE3-WheelLegged-Recovery-FineTune-GRU` | 倒地自启 fine-tune 阶段，使用台阶/恢复状态缓存继续训练 |
@@ -18,6 +19,15 @@
 | `jump_finetune/` | `SE3-WheelLegged-Jump-FineTune-GRU` | 跳跃 FineTune 阶段，从 PreTrain checkpoint 继续训练 |
 
 阶段命名写在 task id 里。跳跃任务目前只有 `PreTrain` 和 `FineTune` 两个正式入口。
+
+## flat_ly 学习任务
+
+`flat_ly/` 通过 `flat.env_cfg()` 和 `flat.rl_cfg()` 继承平地基模，再从本任务目录
+依次调用观测、动作、指令、奖励、终止、课程和事件配置接口。奖励入口会清空继承
+的奖励表，具体奖励函数、参数和权重留给学习者设计；奖励为空时只能构造环境和
+检查接口，不能得到有效训练策略。任务使用独立的
+`logs/rsl_rl/se3_wheel_leg_flat_ly/` 实验目录。完整学习顺序和命令见
+[`src/se3_train/tasks/flat_ly/README.md`](../src/se3_train/tasks/flat_ly/README.md)。
 
 ## 台阶任务
 
@@ -127,6 +137,7 @@ git diff --check
 uv run python - <<'PY'
 from se3_train.tasks import (
     flat,
+    flat_ly,
     jump_finetune,
     jump_pretrain,
     recovery,
@@ -139,6 +150,7 @@ from se3_train.tasks import (
 for module in (
     rough,
     flat,
+    flat_ly,
     recovery,
     recovery_discovery,
     recovery_finetune,
