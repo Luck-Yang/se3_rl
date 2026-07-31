@@ -37,11 +37,24 @@ def configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
             # 原 flat 的姿态项权重为 -12 * (pitch² + roll²)，这里等价拆成两轴。
             "pitch_angle": RewardTermCfg(
                 func=pitch_angle_penalty,
-                weight=-20.0,
+                weight=-30.0,
             ),
             "roll_angle": RewardTermCfg(
                 func=roll_angle_penalty,
                 weight=-15.0,
+            ),
+            # 相对目标指令惩罚机身前后速度与偏航角速度误差，允许小范围传感器噪声。
+            "command_velocity_error": RewardTermCfg(
+                func=mdp_rewards.command_velocity_error,
+                weight=-10.0,
+                params={
+                    "command_name": "velocity_height",
+                    "lin_vel_scale": 0.5,
+                    "yaw_vel_scale": 1.0,
+                    "lin_deadband": 0.05,
+                    "yaw_deadband": 0.10,
+                    "max_penalty": 15.0,
+                },
             ),
             # 任一腿部 Link 触地都扣分。
             "leg_ground_contact": RewardTermCfg(
