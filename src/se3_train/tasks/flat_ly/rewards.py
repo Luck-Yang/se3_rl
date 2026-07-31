@@ -10,6 +10,7 @@ from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 from se3_train.mdp import rewards as mdp_rewards
+from se3_train.mdp.diagnostic_logging import should_log_diagnostics
 
 if TYPE_CHECKING:
     from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -29,6 +30,74 @@ def roll_angle_penalty(env: ManagerBasedRlEnv) -> torch.Tensor:
     return torch.square(roll)
 
 
+def upright_orientation_reward(
+    env: ManagerBasedRlEnv,
+    sigma: float = 0.05,
+) -> torch.Tensor:
+    """返回 pitch/roll 接近零时的指数直立奖励。"""
+    projected_gravity = env.scene["robot"].data.projected_gravity_b
+    pitch = torch.asin(torch.clamp(projected_gravity[:, 0], -1.0, 1.0))
+    roll = torch.asin(torch.clamp(-projected_gravity[:, 1], -1.0, 1.0))
+    error_sq = torch.square(pitch) + torch.square(roll)
+    reward = torch.exp(-error_sq / max(float(sigma), 1.0e-6))
+
+    if should_log_diagnostics(
+        env,
+        64,
+        attr_name="_se3_reward_log_interval_steps",
+    ):
+        log = env.extras.setdefault("log", {})
+        if isinstance(log, dict):
+            log["Locomotion/flat_ly_upright_score"] = reward.mean().item()
+
+    return reward
+
+
+def velocity_tracking_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    score_sigma: float = 0.03,
+) -> torch.Tensor:
+    """返回前后速度指数奖励，并输出供速度课程使用的平均分。"""
+    robot = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)
+
+    lin_error = robot.data.root_link_lin_vel_b[:, 0] - command[:, 0]
+    lin_error_sq = torch.square(lin_error)
+
+    jump_flag = (
+        command[:, 5] > 0.5
+        if command.shape[1] > 5
+        else torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    )
+    locomotion = ~jump_flag
+
+    sigma = max(float(score_sigma), 1.0e-6)
+    score = torch.exp(-lin_error_sq / sigma)
+    reward = score * locomotion.float()
+
+    if should_log_diagnostics(
+        env,
+        64,
+        attr_name="_se3_reward_log_interval_steps",
+    ):
+        log = env.extras.setdefault("log", {})
+        if isinstance(log, dict):
+            moving = (torch.abs(command[:, 0]) > 0.0) & locomotion
+            score_mask = moving if moving.any() else locomotion
+            score_mean = score[score_mask].mean().item() if score_mask.any() else 0.0
+            error_sq_mean = lin_error_sq[score_mask].mean().item() if score_mask.any() else 0.0
+            log.update(
+                {
+                    "Locomotion/flat_ly_velocity_error_sq": error_sq_mean,
+                    "Locomotion/flat_ly_velocity_score": score_mean,
+                    "Locomotion/tracking_lin_vel_reward_all": score_mean,
+                }
+            )
+
+    return reward
+
+
 def configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
     """配置第一阶段静止站立所需的最小奖励集合。"""
     cfg.rewards.clear()
@@ -37,20 +106,39 @@ def configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
             # 原 flat 的姿态项权重为 -12 * (pitch² + roll²)，这里等价拆成两轴。
             "pitch_angle": RewardTermCfg(
                 func=pitch_angle_penalty,
-                weight=-30.0,
+                weight=-40.0,
             ),
             "roll_angle": RewardTermCfg(
                 func=roll_angle_penalty,
-                weight=-15.0,
+                weight=-30.0,
             ),
-            # 相对目标指令惩罚机身前后速度与偏航角速度误差，允许小范围传感器噪声。
+            "upright_orientation": RewardTermCfg(
+                func=upright_orientation_reward,
+                weight=5.0,
+                params={"sigma": 0.05},
+            ),
+            # 抑制 pitch/roll 两轴的快速摆动，避免只约束角度却持续振荡。
+            "ang_vel_xy": RewardTermCfg(
+                func=mdp_rewards.ang_vel_xy,
+                weight=-0.5,
+            ),
+            # 速度接近目标时给正向指数奖励，并把同一分数交给速度课程。
+            "velocity_tracking_reward": RewardTermCfg(
+                func=velocity_tracking_reward,
+                weight=5.0,
+                params={
+                    "command_name": "velocity_height",
+                    "score_sigma": 0.03,
+                },
+            ),
+            # 保留带死区、归一化和上限的速度违令惩罚。
             "command_velocity_error": RewardTermCfg(
                 func=mdp_rewards.command_velocity_error,
                 weight=-10.0,
                 params={
                     "command_name": "velocity_height",
                     "lin_vel_scale": 0.5,
-                    "yaw_vel_scale": 1.0,
+                    "yaw_vel_scale": 0.5,
                     "lin_deadband": 0.05,
                     "yaw_deadband": 0.10,
                     "max_penalty": 15.0,
