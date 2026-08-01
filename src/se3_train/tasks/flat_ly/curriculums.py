@@ -13,7 +13,7 @@ def configure_curriculums(cfg: ManagerBasedRlEnvCfg, *, play: bool) -> None:
     command_vel_cfg = cfg.curriculum["command_vel"]
     command_vel_cfg.params.update(
         {
-            "lin_vel_x_step": 0.2,
+            "lin_vel_x_step": 0.1,
             "max_lin_vel_x": 2.0,
             "init_lin_vel_x": 0.0,
             "ang_vel_yaw_step": 0.0,
