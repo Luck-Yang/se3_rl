@@ -26,6 +26,23 @@ if TYPE_CHECKING:
 _GRAVITY_M_S2 = 9.81
 
 
+def _standing_mask(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+    """返回指令生成器显式采样的静站环境。"""
+    term = env.command_manager.get_term(command_name)
+    mask = getattr(term, "_standing_mask", None)
+    if isinstance(mask, torch.Tensor) and mask.shape == (env.num_envs,):
+        return mask.to(device=env.device, dtype=torch.bool)
+    command = env.command_manager.get_command(command_name)
+    return torch.abs(command[:, 0]) <= 0.02
+
+
+def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """返回分桶均值；无样本时返回零。"""
+    if mask.any():
+        return value[mask].mean()
+    return torch.zeros((), device=value.device, dtype=value.dtype)
+
+
 def _orientation_state(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -51,6 +68,8 @@ def _orientation_state(
     pitch_ref = torch.atan(accel_ref / _GRAVITY_M_S2)
     pitch_limit = math.radians(float(max_pitch_deg))
     pitch_ref = torch.clamp(pitch_ref, -pitch_limit, pitch_limit)
+    # 静站的物理平衡点必须是 pitch=0，不允许用长期倾斜换取滚动速度。
+    pitch_ref = torch.where(_standing_mask(env, command_name), 0.0, pitch_ref)
 
     return {
         "pitch": pitch,
@@ -130,16 +149,19 @@ def roll_stability_penalty(
     )
 
 
-def yaw_rate_stability_penalty(
+def yaw_rate_tracking_penalty(
     env: ManagerBasedRlEnv,
+    command_name: str,
     deadband: float = 0.01,
     scale: float = 0.15,
     max_penalty: float = 9.0,
 ) -> torch.Tensor:
-    """惩罚机身 yaw 角速度，压制小角速度长时间积累成大航向漂移。"""
+    """惩罚 yaw 角速度跟踪误差，静站指令为零时自然压制漂移。"""
     yaw_rate = env.scene["robot"].data.root_link_ang_vel_b[:, 2]
+    yaw_rate_command = env.command_manager.get_command(command_name)[:, 1]
+    yaw_rate_error = yaw_rate - yaw_rate_command
     penalty = _scaled_deadband_square(
-        yaw_rate,
+        yaw_rate_error,
         deadband=deadband,
         scale=scale,
         max_penalty=max_penalty,
@@ -148,7 +170,9 @@ def yaw_rate_stability_penalty(
         env.extras.setdefault("log", {}).update(
             {
                 "Locomotion/flat_ly_yaw_rate_abs": yaw_rate.abs().mean().item(),
-                "Locomotion/flat_ly_yaw_rate_penalty": penalty.mean().item(),
+                "Locomotion/flat_ly_yaw_rate_command_abs": yaw_rate_command.abs().mean().item(),
+                "Locomotion/flat_ly_yaw_rate_error_abs": yaw_rate_error.abs().mean().item(),
+                "Locomotion/flat_ly_yaw_rate_tracking_penalty": penalty.mean().item(),
             }
         )
     return penalty
@@ -176,6 +200,107 @@ def lateral_velocity_penalty(
             }
         )
     return penalty
+
+
+def _standing_stationkeeping_values(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """返回静站的有梯度惩罚、指数分数和样本掩码。"""
+    robot = env.scene["robot"]
+    standing = _standing_mask(env, command_name)
+    orientation = _orientation_state(env, command_name, 0.6, 1.0, 8.0)
+    wheel_vel = robot.data.joint_vel[:, wheel_joint_ids(robot)]
+    wheel_forward_speed = torch.stack(
+        (wheel_vel[:, 0] * 0.059, -wheel_vel[:, 1] * 0.059),
+        dim=1,
+    )
+    wheel_speed_penalty = _scaled_deadband_square(
+        wheel_forward_speed,
+        deadband=0.03,
+        scale=0.15,
+        max_penalty=16.0,
+    ).mean(dim=1)
+
+    components = torch.stack(
+        (
+            _scaled_deadband_square(
+                robot.data.root_link_lin_vel_b[:, 0],
+                deadband=0.02,
+                scale=0.12,
+                max_penalty=16.0,
+            ),
+            _scaled_deadband_square(
+                robot.data.root_link_lin_vel_b[:, 1],
+                deadband=0.02,
+                scale=0.12,
+                max_penalty=16.0,
+            ),
+            _scaled_deadband_square(
+                orientation["pitch"],
+                deadband=math.radians(1.0),
+                scale=math.radians(4.0),
+                max_penalty=16.0,
+            ),
+            _scaled_deadband_square(
+                robot.data.root_link_ang_vel_b[:, 2],
+                deadband=0.01,
+                scale=0.10,
+                max_penalty=16.0,
+            ),
+            wheel_speed_penalty,
+        ),
+        dim=1,
+    )
+    penalty = torch.clamp(components.sum(dim=1), max=16.0)
+    score = torch.exp(-penalty)
+    return penalty * standing.float(), score * standing.float(), standing
+
+
+def standing_stationkeeping_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+) -> torch.Tensor:
+    """静站专属惩罚：同时压制前后/侧向漂移、pitch 和 yaw 角速度。"""
+    penalty, _, standing = _standing_stationkeeping_values(env, command_name)
+    if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
+        robot = env.scene["robot"]
+        orientation = _orientation_state(env, command_name, 0.6, 1.0, 8.0)
+        wheel_vel = robot.data.joint_vel[:, wheel_joint_ids(robot)]
+        wheel_forward_speed = torch.stack(
+            (wheel_vel[:, 0] * 0.059, -wheel_vel[:, 1] * 0.059),
+            dim=1,
+        )
+        env.extras.setdefault("log", {}).update(
+            {
+                "Locomotion/flat_ly_stand_vx_abs": _masked_mean(
+                    robot.data.root_link_lin_vel_b[:, 0].abs(), standing
+                ).item(),
+                "Locomotion/flat_ly_stand_vy_abs": _masked_mean(
+                    robot.data.root_link_lin_vel_b[:, 1].abs(), standing
+                ).item(),
+                "Locomotion/flat_ly_stand_pitch_abs_deg": torch.rad2deg(
+                    _masked_mean(orientation["pitch"].abs(), standing)
+                ).item(),
+                "Locomotion/flat_ly_stand_yaw_rate_abs": _masked_mean(
+                    robot.data.root_link_ang_vel_b[:, 2].abs(), standing
+                ).item(),
+                "Locomotion/flat_ly_stand_wheel_speed_abs": _masked_mean(
+                    wheel_forward_speed.abs().mean(dim=1), standing
+                ).item(),
+                "Locomotion/flat_ly_stand_penalty": _masked_mean(penalty, standing).item(),
+            }
+        )
+    return penalty
+
+
+def standing_stationkeeping_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+) -> torch.Tensor:
+    """静站专属正奖励，只在零速指令子集生效。"""
+    _, score, _ = _standing_stationkeeping_values(env, command_name)
+    return score
 
 
 def _wheel_body_ids(env: ManagerBasedRlEnv) -> list[int]:
@@ -419,8 +544,9 @@ def physical_stability_reward(
     velocity_error = robot.data.root_link_lin_vel_b[:, 0] - command[:, 0]
     velocity_score = torch.exp(-(velocity_error**2) / max(float(velocity_sigma), 1.0e-6))
     yaw_rate = robot.data.root_link_ang_vel_b[:, 2]
+    yaw_rate_error = yaw_rate - command[:, 1]
     yaw_penalty = _scaled_deadband_square(
-        yaw_rate,
+        yaw_rate_error,
         deadband=0.01,
         scale=0.15,
         max_penalty=9.0,
@@ -490,7 +616,7 @@ def physical_stability_reward(
     per_env_course_score = components.min(dim=1).values
 
     # 课程使用分桶最弱项，避免运动样本掩盖静站或扰动恢复失败。
-    standing_mask = torch.abs(command[:, 0]) <= 0.02
+    standing_mask = _standing_mask(env, command_name)
     recovery_mask = recovery_state.recovery_episode_mask(env)
 
     zero_speed_penalty = _scaled_deadband_square(
@@ -500,13 +626,11 @@ def physical_stability_reward(
         max_penalty=9.0,
     )
     zero_speed_score = torch.exp(-zero_speed_penalty)
+    _, standing_stationkeeping_score, _ = _standing_stationkeeping_values(env, command_name)
     standing_per_env = (
         torch.stack(
             (
-                zero_speed_score,
-                orientation_score,
-                yaw_score,
-                lateral_score,
+                standing_stationkeeping_score,
                 load_score,
                 rolling_score,
             ),
@@ -642,7 +766,7 @@ def velocity_tracking_reward(
 
 
 def configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
-    """配置 V6 平地静站、直行与抗扰物理奖励集合。"""
+    """配置 V7 平地静站、直行与抗扰物理奖励集合。"""
     cfg.rewards.clear()
     cfg.rewards.update(
         {
@@ -674,10 +798,11 @@ def configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
                 func=mdp_rewards.ang_vel_xy,
                 weight=-0.2,
             ),
-            "yaw_rate_stability": RewardTermCfg(
-                func=yaw_rate_stability_penalty,
+            "yaw_rate_tracking": RewardTermCfg(
+                func=yaw_rate_tracking_penalty,
                 weight=-2.0,
                 params={
+                    "command_name": "velocity_height",
                     "deadband": 0.01,
                     "scale": 0.15,
                     "max_penalty": 9.0,
@@ -711,6 +836,17 @@ def configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
                     "yaw_deadband": 0.01,
                     "max_penalty": 15.0,
                 },
+            ),
+            # 静站样本单独约束零速、水平姿态和轮速，避免运动均值掩盖漂移。
+            "standing_stationkeeping_penalty": RewardTermCfg(
+                func=standing_stationkeeping_penalty,
+                weight=-2.0,
+                params={"command_name": "velocity_height"},
+            ),
+            "standing_stationkeeping_reward": RewardTermCfg(
+                func=standing_stationkeeping_reward,
+                weight=3.0,
+                params={"command_name": "velocity_height"},
             ),
             # 正奖励同时考虑速度、动态姿态、轮轴、承载和滚动一致性。
             "physical_stability": RewardTermCfg(

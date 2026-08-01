@@ -21,4 +21,8 @@ def env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     curriculums.configure_curriculums(cfg, play=play)
     events.configure_events(cfg, play=play)
 
+    if not play:
+        # 20 s 后才出现的慢性漂移必须留在同一 episode 内被奖励看见。
+        cfg.episode_length_s = 40.0
+
     return cfg

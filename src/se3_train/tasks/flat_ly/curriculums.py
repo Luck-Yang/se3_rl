@@ -24,6 +24,7 @@ def commands_vel_physical(
     command_name: str,
     lin_vel_x_step: float = 0.1,
     max_lin_vel_x: float = 2.0,
+    max_ang_vel_yaw: float = 0.3,
     init_lin_vel_x: float = 0.0,
     advance_threshold: float = 0.65,
     ema_alpha: float = 0.05,
@@ -67,11 +68,13 @@ def commands_vel_physical(
         setattr(env, _STAGE_START_STEP_ATTR, stage_start_step)
 
     cfg.lin_vel_x_range = (-lin_x_max, lin_x_max)
-    cfg.ang_vel_yaw_range = (0.0, 0.0)
+    # 外层 yaw PID 输出的是现有 yaw_rate 指令；随速度课程渐进展开分布。
+    yaw_max = min(max(float(lin_x_max), 0.0), max(float(max_ang_vel_yaw), 0.0))
+    cfg.ang_vel_yaw_range = (-yaw_max, yaw_max)
 
     return {
         "lin_vel_x_max": torch.tensor(lin_x_max, device=env.device),
-        "ang_vel_yaw_max": torch.tensor(0.0, device=env.device),
+        "ang_vel_yaw_max": torch.tensor(yaw_max, device=env.device),
         "physical_ema": torch.tensor(ema, device=env.device),
         "stage_dwell_progress": torch.tensor(
             min(
@@ -100,6 +103,7 @@ def configure_curriculums(cfg: ManagerBasedRlEnvCfg, *, play: bool) -> None:
             "command_name": "velocity_height",
             "lin_vel_x_step": 0.1,
             "max_lin_vel_x": 2.0,
+            "max_ang_vel_yaw": 0.3,
             "init_lin_vel_x": 0.0,
             "advance_threshold": 0.65,
             "ema_alpha": 0.05,
