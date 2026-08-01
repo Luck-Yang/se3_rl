@@ -13,6 +13,7 @@ from mjlab.sensor import ContactSensor
 from mjlab.utils.lab_api.math import quat_apply_inverse
 
 from se3_shared import wrap_front_action_value_delta_torch
+from se3_train.mdp import recovery_state
 from se3_train.mdp import rewards as mdp_rewards
 from se3_train.mdp.contact_utils import finite_contact_force_norm
 from se3_train.mdp.diagnostic_logging import should_log_diagnostics
@@ -127,6 +128,54 @@ def roll_stability_penalty(
         scale=math.radians(float(scale_deg)),
         max_penalty=max_penalty,
     )
+
+
+def yaw_rate_stability_penalty(
+    env: ManagerBasedRlEnv,
+    deadband: float = 0.01,
+    scale: float = 0.15,
+    max_penalty: float = 9.0,
+) -> torch.Tensor:
+    """惩罚机身 yaw 角速度，压制小角速度长时间积累成大航向漂移。"""
+    yaw_rate = env.scene["robot"].data.root_link_ang_vel_b[:, 2]
+    penalty = _scaled_deadband_square(
+        yaw_rate,
+        deadband=deadband,
+        scale=scale,
+        max_penalty=max_penalty,
+    )
+    if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
+        env.extras.setdefault("log", {}).update(
+            {
+                "Locomotion/flat_ly_yaw_rate_abs": yaw_rate.abs().mean().item(),
+                "Locomotion/flat_ly_yaw_rate_penalty": penalty.mean().item(),
+            }
+        )
+    return penalty
+
+
+def lateral_velocity_penalty(
+    env: ManagerBasedRlEnv,
+    deadband: float = 0.03,
+    scale: float = 0.20,
+    max_penalty: float = 9.0,
+) -> torch.Tensor:
+    """惩罚机身侧向速度，平地差速轮直行时目标为零。"""
+    lateral_velocity = env.scene["robot"].data.root_link_lin_vel_b[:, 1]
+    penalty = _scaled_deadband_square(
+        lateral_velocity,
+        deadband=deadband,
+        scale=scale,
+        max_penalty=max_penalty,
+    )
+    if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
+        env.extras.setdefault("log", {}).update(
+            {
+                "Locomotion/flat_ly_lateral_velocity_abs": lateral_velocity.abs().mean().item(),
+                "Locomotion/flat_ly_lateral_velocity_penalty": penalty.mean().item(),
+            }
+        )
+    return penalty
 
 
 def _wheel_body_ids(env: ManagerBasedRlEnv) -> list[int]:
@@ -369,6 +418,22 @@ def physical_stability_reward(
     command = env.command_manager.get_command(command_name)
     velocity_error = robot.data.root_link_lin_vel_b[:, 0] - command[:, 0]
     velocity_score = torch.exp(-(velocity_error**2) / max(float(velocity_sigma), 1.0e-6))
+    yaw_rate = robot.data.root_link_ang_vel_b[:, 2]
+    yaw_penalty = _scaled_deadband_square(
+        yaw_rate,
+        deadband=0.01,
+        scale=0.15,
+        max_penalty=9.0,
+    )
+    yaw_score = torch.exp(-yaw_penalty)
+    lateral_velocity = robot.data.root_link_lin_vel_b[:, 1]
+    lateral_penalty = _scaled_deadband_square(
+        lateral_velocity,
+        deadband=0.03,
+        scale=0.20,
+        max_penalty=9.0,
+    )
+    lateral_score = torch.exp(-lateral_penalty)
 
     orientation = _orientation_state(env, command_name, 0.6, 1.0, 8.0)
     pitch_penalty = _scaled_deadband_square(
@@ -410,21 +475,85 @@ def physical_stability_reward(
     rolling_score = torch.exp(-rolling_penalty) * rolling_contact.float()
 
     components = torch.stack(
-        (velocity_score, orientation_score, geometry_score, load_score, rolling_score),
+        (
+            velocity_score,
+            orientation_score,
+            yaw_score,
+            lateral_score,
+            geometry_score,
+            load_score,
+            rolling_score,
+        ),
         dim=1,
     )
     reward = components.mean(dim=1)
-    course_score = components.min(dim=1).values
+    per_env_course_score = components.min(dim=1).values
+
+    # 课程使用分桶最弱项，避免运动样本掩盖静站或扰动恢复失败。
+    standing_mask = torch.abs(command[:, 0]) <= 0.02
+    recovery_mask = recovery_state.recovery_episode_mask(env)
+
+    zero_speed_penalty = _scaled_deadband_square(
+        robot.data.root_link_lin_vel_b[:, 0],
+        deadband=0.03,
+        scale=0.15,
+        max_penalty=9.0,
+    )
+    zero_speed_score = torch.exp(-zero_speed_penalty)
+    standing_per_env = (
+        torch.stack(
+            (
+                zero_speed_score,
+                orientation_score,
+                yaw_score,
+                lateral_score,
+                load_score,
+                rolling_score,
+            ),
+            dim=1,
+        )
+        .min(dim=1)
+        .values
+    )
+    recovery_per_env = (
+        torch.stack(
+            (
+                zero_speed_score,
+                orientation_score,
+                yaw_score,
+                lateral_score,
+                load_score,
+            ),
+            dim=1,
+        )
+        .min(dim=1)
+        .values
+    )
+
+    base_course_mean = per_env_course_score.mean()
+    standing_course_mean = (
+        standing_per_env[standing_mask].mean() if standing_mask.any() else base_course_mean
+    )
+    recovery_course_mean = (
+        recovery_per_env[recovery_mask].mean() if recovery_mask.any() else base_course_mean
+    )
+    course_score = torch.stack((base_course_mean, standing_course_mean, recovery_course_mean)).min()
 
     if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
         env.extras.setdefault("log", {}).update(
             {
                 "Locomotion/flat_ly_physical_stability_reward": reward.mean().item(),
-                "Locomotion/flat_ly_course_score": course_score.mean().item(),
+                "Locomotion/flat_ly_course_score": course_score.item(),
                 "Locomotion/flat_ly_course_orientation_score": orientation_score.mean().item(),
+                "Locomotion/flat_ly_course_yaw_score": yaw_score.mean().item(),
+                "Locomotion/flat_ly_course_lateral_score": lateral_score.mean().item(),
                 "Locomotion/flat_ly_course_geometry_score": geometry_score.mean().item(),
                 "Locomotion/flat_ly_course_load_score": load_score.mean().item(),
                 "Locomotion/flat_ly_course_rolling_score": rolling_score.mean().item(),
+                "Locomotion/flat_ly_course_standing_score": standing_course_mean.item(),
+                "Locomotion/flat_ly_course_recovery_score": recovery_course_mean.item(),
+                "Locomotion/flat_ly_standing_sample_ratio": standing_mask.float().mean().item(),
+                "Locomotion/flat_ly_recovery_sample_ratio": recovery_mask.float().mean().item(),
             }
         )
     return reward
@@ -513,7 +642,7 @@ def velocity_tracking_reward(
 
 
 def configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
-    """配置 V5 平地轮式行走的物理目标奖励集合。"""
+    """配置 V6 平地静站、直行与抗扰物理奖励集合。"""
     cfg.rewards.clear()
     cfg.rewards.update(
         {
@@ -545,6 +674,24 @@ def configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
                 func=mdp_rewards.ang_vel_xy,
                 weight=-0.2,
             ),
+            "yaw_rate_stability": RewardTermCfg(
+                func=yaw_rate_stability_penalty,
+                weight=-2.0,
+                params={
+                    "deadband": 0.01,
+                    "scale": 0.15,
+                    "max_penalty": 9.0,
+                },
+            ),
+            "lateral_velocity": RewardTermCfg(
+                func=lateral_velocity_penalty,
+                weight=-1.0,
+                params={
+                    "deadband": 0.03,
+                    "scale": 0.20,
+                    "max_penalty": 9.0,
+                },
+            ),
             "velocity_tracking_reward": RewardTermCfg(
                 func=velocity_tracking_reward,
                 weight=5.0,
@@ -559,9 +706,9 @@ def configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
                 params={
                     "command_name": "velocity_height",
                     "lin_vel_scale": 0.5,
-                    "yaw_vel_scale": 0.5,
+                    "yaw_vel_scale": 0.25,
                     "lin_deadband": 0.05,
-                    "yaw_deadband": 0.10,
+                    "yaw_deadband": 0.01,
                     "max_penalty": 15.0,
                 },
             ),
