@@ -31,6 +31,8 @@ class VelocityHeightCommandCfg(CommandTermCfg):
     yaw_deadband: float = 0.1
     standing_ratio: float = 0.1
     resampling_time_range: tuple[float, float] = (5.0, 5.0)
+    lin_vel_slew_rate: float | None = None
+    """x 速度指令的最大变化率(m/s²)；None 保持阶跃指令。"""
     height_resample_on_reset_only: bool = False
     """是否只在 reset 时采样高度指令；普通重采样只更新速度和姿态指令。"""
     constrain_diff_drive_commands: bool = False
@@ -69,6 +71,8 @@ class VelocityHeightCommandTerm(CommandTerm):
         # 5 维指令: [lin_vel_x, ang_vel_yaw, pitch, roll, height]
         self._command = torch.zeros(self.num_envs, 5, device=self.device)
         self._standing_mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self._lin_vel_target = torch.zeros(self.num_envs, device=self.device)
+        self._lin_vel_accel = torch.zeros(self.num_envs, device=self.device)
         self._resampling_for_reset = False
         self._pre_resampled_for_reset = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
@@ -77,6 +81,16 @@ class VelocityHeightCommandTerm(CommandTerm):
     @property
     def command(self) -> torch.Tensor:
         return self._command
+
+    @property
+    def lin_vel_target(self) -> torch.Tensor:
+        """返回重采样后的原始 x 速度目标。"""
+        return self._lin_vel_target
+
+    @property
+    def lin_vel_accel(self) -> torch.Tensor:
+        """返回限速后指令的当前加速度。"""
+        return self._lin_vel_accel
 
     def reset(self, env_ids: torch.Tensor | slice | None) -> dict[str, float]:
         """重置指令项，并保留 reset 事件阶段已预采样的指令。"""
@@ -184,7 +198,10 @@ class VelocityHeightCommandTerm(CommandTerm):
         self._standing_mask[moving_ids] = False
 
         # 站立环境:零速度,默认姿态,按站立高度范围采样。
-        self._command[standing_ids, 0] = 0.0
+        self._lin_vel_target[standing_ids] = 0.0
+        if self.cfg.lin_vel_slew_rate is None or self._resampling_for_reset:
+            self._command[standing_ids, 0] = 0.0
+            self._lin_vel_accel[standing_ids] = 0.0
         self._command[standing_ids, 1] = 0.0
         self._command[standing_ids, 2] = 0.0  # pitch = 0
         self._command[standing_ids, 3] = 0.0  # roll = 0
@@ -212,6 +229,11 @@ class VelocityHeightCommandTerm(CommandTerm):
                 + self.cfg.ang_vel_yaw_range[0]
             )
             lin_vel, yaw_vel = self._constrain_diff_drive_command(lin_vel, yaw_vel)
+            lin_vel = torch.where(
+                torch.abs(lin_vel) < self.cfg.lin_vel_deadband,
+                torch.zeros_like(lin_vel),
+                lin_vel,
+            )
             pitch = (
                 torch.rand(len(moving_ids), device=self.device)
                 * (self.cfg.pitch_range[1] - self.cfg.pitch_range[0])
@@ -222,7 +244,13 @@ class VelocityHeightCommandTerm(CommandTerm):
                 * (self.cfg.roll_range[1] - self.cfg.roll_range[0])
                 + self.cfg.roll_range[0]
             )
-            self._command[moving_ids, 0] = lin_vel
+            self._lin_vel_target[moving_ids] = lin_vel
+            if self.cfg.lin_vel_slew_rate is None:
+                self._command[moving_ids, 0] = lin_vel
+            elif self._resampling_for_reset:
+                # reset 后物理速度从零开始，指令也应从零平滑爬升。
+                self._command[moving_ids, 0] = 0.0
+                self._lin_vel_accel[moving_ids] = 0.0
             self._command[moving_ids, 1] = yaw_vel
             self._command[moving_ids, 2] = pitch
             self._command[moving_ids, 3] = roll
@@ -362,17 +390,28 @@ class VelocityHeightCommandTerm(CommandTerm):
         return lin_vel, yaw_vel
 
     def _update_command(self) -> None:
-        """对速度指令施加死区。"""
+        """对速度指令施加加速度限幅和死区。"""
         moving = ~self._standing_mask
         lin_vel = self._command[:, 0]
         yaw_vel = self._command[:, 1]
 
-        # 将小速度置零(死区)。
-        lin_vel = torch.where(
-            moving & (torch.abs(lin_vel) < self.cfg.lin_vel_deadband),
-            torch.zeros_like(lin_vel),
-            lin_vel,
-        )
+        slew_rate = self.cfg.lin_vel_slew_rate
+        if slew_rate is None:
+            # 未开启限速时保持原有指令语义。
+            lin_vel = torch.where(
+                moving & (torch.abs(lin_vel) < self.cfg.lin_vel_deadband),
+                torch.zeros_like(lin_vel),
+                lin_vel,
+            )
+            self._lin_vel_target[:] = lin_vel
+            self._lin_vel_accel.zero_()
+        else:
+            dt = max(float(getattr(self._env, "step_dt", 0.02)), 1.0e-6)
+            max_delta = max(float(slew_rate), 0.0) * dt
+            previous = lin_vel.clone()
+            delta = torch.clamp(self._lin_vel_target - previous, -max_delta, max_delta)
+            lin_vel = previous + delta
+            self._lin_vel_accel[:] = (lin_vel - previous) / dt
         yaw_vel = torch.where(
             moving & (torch.abs(yaw_vel) < self.cfg.yaw_deadband),
             torch.zeros_like(yaw_vel),
