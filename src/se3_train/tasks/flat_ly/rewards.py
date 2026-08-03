@@ -89,6 +89,12 @@ def _scaled_deadband_square(
     return torch.clamp(penalty, max=float(max_penalty))
 
 
+def _smooth_bounded_square(raw_penalty: torch.Tensor, max_penalty: float) -> torch.Tensor:
+    """平滑限制平方惩罚；小误差近似原值，大误差渐近有限上限。"""
+    limit = max(float(max_penalty), 1.0e-6)
+    return limit * torch.tanh(raw_penalty / limit)
+
+
 def dynamic_pitch_penalty(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -353,12 +359,13 @@ def standing_low_frequency_drift_penalty(
     command_name: str,
     tau_s: float = 0.75,
     base_deadband: float = 0.01,
-    base_scale: float = 0.08,
+    base_scale: float = 0.05,
     wheel_deadband: float = 0.03,
-    wheel_scale: float = 0.12,
+    wheel_scale: float = 0.10,
     wheel_weight: float = 0.25,
+    max_penalty: float = 4.0,
 ) -> torch.Tensor:
-    """惩罚静站的低频速度偏置，同时允许轮子高频往复纠偏。"""
+    """平滑有界地惩罚静站低频偏置，同时允许轮子高频往复纠偏。"""
     robot = env.scene["robot"]
     standing = _standing_mask(env, command_name)
     wheel_vel = robot.data.joint_vel[:, wheel_joint_ids(robot)]
@@ -377,20 +384,23 @@ def standing_low_frequency_drift_penalty(
     dt = max(float(getattr(env, "step_dt", 0.02)), 1.0e-6)
     alpha = 1.0 - math.exp(-dt / max(float(tau_s), dt))
     reset_mask = env.episode_length_buf <= 1
-    base_ema[reset_mask] = 0.0
-    wheel_ema[reset_mask] = 0.0
-    base_ema.lerp_(base_vx, alpha)
-    wheel_ema.lerp_(wheel_forward, alpha)
+    # 非静站阶段不积累历史，运动指令切回静站时从零开始估计长期偏置。
+    clear_mask = reset_mask | ~standing
+    base_ema[clear_mask] = 0.0
+    wheel_ema[clear_mask] = 0.0
+    base_ema.lerp_(torch.where(standing, base_vx, torch.zeros_like(base_vx)), alpha)
+    wheel_ema.lerp_(torch.where(standing, wheel_forward, torch.zeros_like(wheel_forward)), alpha)
 
-    base_penalty = torch.square(
+    base_penalty_raw = torch.square(
         torch.clamp(torch.abs(base_ema) - float(base_deadband), min=0.0)
         / max(float(base_scale), 1.0e-6)
     )
-    wheel_penalty = torch.square(
+    wheel_penalty_raw = torch.square(
         torch.clamp(torch.abs(wheel_ema) - float(wheel_deadband), min=0.0)
         / max(float(wheel_scale), 1.0e-6)
     )
-    penalty = (base_penalty + float(wheel_weight) * wheel_penalty) * standing.float()
+    raw_penalty = base_penalty_raw + float(wheel_weight) * wheel_penalty_raw
+    penalty = _smooth_bounded_square(raw_penalty, max_penalty) * standing.float()
     if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
         env.extras.setdefault("log", {}).update(
             {
@@ -402,6 +412,9 @@ def standing_low_frequency_drift_penalty(
                 ).item(),
                 "Locomotion/flat_ly_stand_low_frequency_penalty": _masked_mean(
                     penalty, standing
+                ).item(),
+                "Locomotion/flat_ly_stand_low_frequency_raw_penalty": _masked_mean(
+                    raw_penalty, standing
                 ).item(),
             }
         )
@@ -1139,10 +1152,11 @@ def configure_rewards(
                 "command_name": "velocity_height",
                 "tau_s": 0.75,
                 "base_deadband": 0.01,
-                "base_scale": 0.08,
+                "base_scale": 0.05,
                 "wheel_deadband": 0.03,
-                "wheel_scale": 0.12,
+                "wheel_scale": 0.10,
                 "wheel_weight": 0.25,
+                "max_penalty": 4.0,
             },
         )
 
