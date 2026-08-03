@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -174,6 +174,67 @@ def yaw_rate_tracking_penalty(
     return penalty
 
 
+def yaw_rate_huber_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    deadband: float = 0.03,
+    base_scale: float = 0.5,
+    relative_scale: float = 0.05,
+) -> torch.Tensor:
+    """高速 yaw 跟踪 Huber 惩罚，大误差区仍保留线性学习信号。"""
+    robot = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)[:, 1]
+    error = torch.abs(robot.data.root_link_ang_vel_b[:, 2] - command)
+    excess = torch.clamp(error - float(deadband), min=0.0)
+    scale = float(base_scale) + float(relative_scale) * torch.abs(command)
+    normalized = excess / torch.clamp(scale, min=1.0e-6)
+    return torch.where(normalized <= 1.0, 0.5 * normalized**2, normalized - 0.5)
+
+
+def yaw_rate_precision_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    base_scale: float = 0.2,
+    relative_scale: float = 0.08,
+) -> torch.Tensor:
+    """按相对误差奖励高速和低速 yaw-rate 的近目标精度。"""
+    robot = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)[:, 1]
+    error = robot.data.root_link_ang_vel_b[:, 2] - command
+    scale = float(base_scale) + float(relative_scale) * torch.abs(command)
+    return torch.exp(-torch.square(error / torch.clamp(scale, min=1.0e-6)))
+
+
+def yaw_rate_progress_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    min_command: float = 0.05,
+) -> torch.Tensor:
+    """奖励沿指令符号建立角速度，避免高速目标初期只有稀疏精度奖励。"""
+    command = env.command_manager.get_command(command_name)[:, 1]
+    yaw_rate = env.scene["robot"].data.root_link_ang_vel_b[:, 2]
+    active = torch.abs(command) > float(min_command)
+    progress = yaw_rate * torch.sign(command) / torch.clamp(torch.abs(command), min=min_command)
+    return torch.clamp(progress, min=-1.0, max=1.0) * active.float()
+
+
+def in_place_translation_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    max_linear_command: float = 0.05,
+    min_yaw_command: float = 0.1,
+    velocity_scale: float = 0.25,
+) -> torch.Tensor:
+    """原地转向时惩罚机身平移，防止用画圈代替绕自身中心旋转。"""
+    command = env.command_manager.get_command(command_name)
+    active = (torch.abs(command[:, 0]) <= float(max_linear_command)) & (
+        torch.abs(command[:, 1]) >= float(min_yaw_command)
+    )
+    lin_vel_xy = env.scene["robot"].data.root_link_lin_vel_b[:, :2]
+    penalty = torch.sum(torch.square(lin_vel_xy / max(float(velocity_scale), 1.0e-6)), dim=1)
+    return penalty * active.float()
+
+
 def lateral_velocity_penalty(
     env: ManagerBasedRlEnv,
     deadband: float = 0.03,
@@ -285,6 +346,66 @@ def standing_stationkeeping_reward(
     """静站专属正奖励，只在零速指令子集生效。"""
     _, score, _ = _standing_stationkeeping_values(env, command_name)
     return score
+
+
+def standing_low_frequency_drift_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    tau_s: float = 0.75,
+    base_deadband: float = 0.01,
+    base_scale: float = 0.08,
+    wheel_deadband: float = 0.03,
+    wheel_scale: float = 0.12,
+    wheel_weight: float = 0.25,
+) -> torch.Tensor:
+    """惩罚静站的低频速度偏置，同时允许轮子高频往复纠偏。"""
+    robot = env.scene["robot"]
+    standing = _standing_mask(env, command_name)
+    wheel_vel = robot.data.joint_vel[:, wheel_joint_ids(robot)]
+    wheel_forward = 0.5 * (wheel_vel[:, 0] * 0.059 - wheel_vel[:, 1] * 0.059)
+    base_vx = robot.data.root_link_lin_vel_b[:, 0]
+
+    base_ema = getattr(env, "_flat_ly_stand_base_vx_ema", None)
+    wheel_ema = getattr(env, "_flat_ly_stand_wheel_vx_ema", None)
+    if not isinstance(base_ema, torch.Tensor) or base_ema.shape[0] != env.num_envs:
+        base_ema = torch.zeros(env.num_envs, device=env.device)
+        wheel_ema = torch.zeros(env.num_envs, device=env.device)
+        env._flat_ly_stand_base_vx_ema = base_ema
+        env._flat_ly_stand_wheel_vx_ema = wheel_ema
+    assert isinstance(wheel_ema, torch.Tensor)
+
+    dt = max(float(getattr(env, "step_dt", 0.02)), 1.0e-6)
+    alpha = 1.0 - math.exp(-dt / max(float(tau_s), dt))
+    reset_mask = env.episode_length_buf <= 1
+    base_ema[reset_mask] = 0.0
+    wheel_ema[reset_mask] = 0.0
+    base_ema.lerp_(base_vx, alpha)
+    wheel_ema.lerp_(wheel_forward, alpha)
+
+    base_penalty = torch.square(
+        torch.clamp(torch.abs(base_ema) - float(base_deadband), min=0.0)
+        / max(float(base_scale), 1.0e-6)
+    )
+    wheel_penalty = torch.square(
+        torch.clamp(torch.abs(wheel_ema) - float(wheel_deadband), min=0.0)
+        / max(float(wheel_scale), 1.0e-6)
+    )
+    penalty = (base_penalty + float(wheel_weight) * wheel_penalty) * standing.float()
+    if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
+        env.extras.setdefault("log", {}).update(
+            {
+                "Locomotion/flat_ly_stand_base_vx_ema_abs": _masked_mean(
+                    torch.abs(base_ema), standing
+                ).item(),
+                "Locomotion/flat_ly_stand_wheel_vx_ema_abs": _masked_mean(
+                    torch.abs(wheel_ema), standing
+                ).item(),
+                "Locomotion/flat_ly_stand_low_frequency_penalty": _masked_mean(
+                    penalty, standing
+                ).item(),
+            }
+        )
+    return penalty
 
 
 def _wheel_body_ids(env: ManagerBasedRlEnv) -> list[int]:
@@ -421,6 +542,7 @@ def _rolling_values(
     env: ManagerBasedRlEnv,
     sensor_name: str,
     wheel_radius: float,
+    half_track: float,
     force_threshold: float,
     deadband: float,
     scale: float,
@@ -432,8 +554,16 @@ def _rolling_values(
         (wheel_vel[:, 0] * float(wheel_radius), -wheel_vel[:, 1] * float(wheel_radius)),
         dim=1,
     )
-    base_vx = robot.data.root_link_lin_vel_b[:, 0].unsqueeze(1)
-    rolling_error = torch.abs(wheel_forward_speed - base_vx)
+    base_vx = robot.data.root_link_lin_vel_b[:, 0]
+    yaw_rate = robot.data.root_link_ang_vel_b[:, 2]
+    expected_wheel_speed = torch.stack(
+        (
+            base_vx - float(half_track) * yaw_rate,
+            base_vx + float(half_track) * yaw_rate,
+        ),
+        dim=1,
+    )
+    rolling_error = torch.abs(wheel_forward_speed - expected_wheel_speed)
 
     sensor: ContactSensor = env.scene[sensor_name]
     if sensor.data.force is None:
@@ -453,16 +583,18 @@ def wheel_rolling_consistency_penalty(
     env: ManagerBasedRlEnv,
     sensor_name: str,
     wheel_radius: float = 0.059,
+    half_track: float = 0.21665,
     force_threshold: float = 1.0,
     deadband: float = 0.15,
     scale: float = 0.50,
     max_penalty: float = 9.0,
 ) -> torch.Tensor:
-    """惩罚接地轮面线速度与机身前进速度不一致，压制打滑和空转。"""
+    """按差速轮刚体运动学惩罚轮面速度误差，兼容直行和原地转向。"""
     penalty, error, both_contact = _rolling_values(
         env,
         sensor_name,
         wheel_radius,
+        half_track,
         force_threshold,
         deadband,
         scale,
@@ -521,6 +653,8 @@ def physical_stability_reward(
     command_name: str,
     sensor_name: str,
     velocity_sigma: float = 0.03,
+    yaw_score_base_scale: float = 0.15,
+    yaw_score_relative_scale: float = 0.0,
 ) -> torch.Tensor:
     """返回物理稳定分数，并输出供课程使用的最弱项综合分。"""
     robot = env.scene["robot"]
@@ -529,11 +663,13 @@ def physical_stability_reward(
     velocity_score = torch.exp(-(velocity_error**2) / max(float(velocity_sigma), 1.0e-6))
     yaw_rate = robot.data.root_link_ang_vel_b[:, 2]
     yaw_rate_error = yaw_rate - command[:, 1]
-    yaw_penalty = _scaled_deadband_square(
-        yaw_rate_error,
-        deadband=0.01,
-        scale=0.15,
-        max_penalty=9.0,
+    yaw_scale = float(yaw_score_base_scale) + float(yaw_score_relative_scale) * torch.abs(
+        command[:, 1]
+    )
+    yaw_excess = torch.clamp(torch.abs(yaw_rate_error) - 0.01, min=0.0)
+    yaw_penalty = torch.clamp(
+        torch.square(yaw_excess / torch.clamp(yaw_scale, min=1.0e-6)),
+        max=9.0,
     )
     yaw_score = torch.exp(-yaw_penalty)
     lateral_velocity = robot.data.root_link_lin_vel_b[:, 1]
@@ -577,6 +713,7 @@ def physical_stability_reward(
         env,
         sensor_name,
         0.059,
+        0.21665,
         1.0,
         0.15,
         0.50,
@@ -651,6 +788,18 @@ def physical_stability_reward(
         if yaw_command_mask.any()
         else torch.zeros((), device=env.device)
     )
+    yaw_positive_mask = command[:, 1] > 0.03
+    yaw_negative_mask = command[:, 1] < -0.03
+    yaw_positive_mean = (
+        per_env_course_score[yaw_positive_mask].mean()
+        if yaw_positive_mask.any()
+        else torch.zeros((), device=env.device)
+    )
+    yaw_negative_mean = (
+        per_env_course_score[yaw_negative_mask].mean()
+        if yaw_negative_mask.any()
+        else torch.zeros((), device=env.device)
+    )
     course_score = torch.stack((base_course_mean, standing_course_mean, recovery_course_mean)).min()
 
     if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
@@ -667,6 +816,8 @@ def physical_stability_reward(
                 "Locomotion/flat_ly_course_standing_score": standing_course_mean.item(),
                 "Locomotion/flat_ly_course_recovery_score": recovery_course_mean.item(),
                 "Locomotion/flat_ly_course_yaw_tracking_score": yaw_course_mean.item(),
+                "Locomotion/flat_ly_course_yaw_positive_score": yaw_positive_mean.item(),
+                "Locomotion/flat_ly_course_yaw_negative_score": yaw_negative_mean.item(),
                 "Locomotion/flat_ly_standing_sample_ratio": standing_mask.float().mean().item(),
                 "Locomotion/flat_ly_recovery_sample_ratio": recovery_mask.float().mean().item(),
                 "Locomotion/flat_ly_yaw_command_sample_ratio": yaw_command_mask.float()
@@ -771,8 +922,12 @@ def velocity_tracking_reward(
     return reward
 
 
-def configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
-    """配置 V8 平地静站、直行与 yaw 内环物理奖励集合。"""
+def configure_rewards(
+    cfg: ManagerBasedRlEnvCfg,
+    *,
+    phase: Literal["base", "stand", "turn", "arc"] = "base",
+) -> None:
+    """按训练阶段配置静站、原地转向和弧线转弯奖励。"""
     cfg.rewards.clear()
     cfg.rewards.update(
         {
@@ -891,6 +1046,7 @@ def configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
                 params={
                     "sensor_name": "wheel_sensor",
                     "wheel_radius": 0.059,
+                    "half_track": 0.21665,
                     "force_threshold": 1.0,
                     "deadband": 0.15,
                     "scale": 0.50,
@@ -974,3 +1130,65 @@ def configure_rewards(cfg: ManagerBasedRlEnvCfg) -> None:
             ),
         }
     )
+
+    if phase in {"stand", "turn", "arc"}:
+        cfg.rewards["standing_low_frequency_drift"] = RewardTermCfg(
+            func=standing_low_frequency_drift_penalty,
+            weight=-5.0 if phase == "stand" else -2.0,
+            params={
+                "command_name": "velocity_height",
+                "tau_s": 0.75,
+                "base_deadband": 0.01,
+                "base_scale": 0.08,
+                "wheel_deadband": 0.03,
+                "wheel_scale": 0.12,
+                "wheel_weight": 0.25,
+            },
+        )
+
+    if phase == "stand":
+        cfg.rewards["standing_stationkeeping_penalty"].weight = -3.0
+        cfg.rewards["standing_stationkeeping_reward"].weight = 5.0
+
+    if phase in {"turn", "arc"}:
+        cfg.rewards["yaw_rate_tracking"] = RewardTermCfg(
+            func=yaw_rate_huber_penalty,
+            weight=-2.0,
+            params={
+                "command_name": "velocity_height",
+                "deadband": 0.03,
+                "base_scale": 0.5,
+                "relative_scale": 0.05,
+            },
+        )
+        cfg.rewards["yaw_rate_precision"] = RewardTermCfg(
+            func=yaw_rate_precision_reward,
+            weight=4.0,
+            params={
+                "command_name": "velocity_height",
+                "base_scale": 0.2,
+                "relative_scale": 0.08,
+            },
+        )
+        cfg.rewards["yaw_rate_progress"] = RewardTermCfg(
+            func=yaw_rate_progress_reward,
+            weight=2.0,
+            params={"command_name": "velocity_height", "min_command": 0.05},
+        )
+        cfg.rewards["in_place_translation"] = RewardTermCfg(
+            func=in_place_translation_penalty,
+            weight=-1.0,
+            params={
+                "command_name": "velocity_height",
+                "max_linear_command": 0.05,
+                "min_yaw_command": 0.1,
+                "velocity_scale": 0.25,
+            },
+        )
+        cfg.rewards["command_velocity_error"].weight = -2.0
+        cfg.rewards["command_velocity_error"].params.update(
+            {"yaw_vel_scale": 4.0, "max_penalty": 25.0}
+        )
+        cfg.rewards["physical_stability"].params.update(
+            {"yaw_score_base_scale": 0.2, "yaw_score_relative_scale": 0.08}
+        )

@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from mjlab.envs import ManagerBasedRlEnvCfg
 
 
-def configure_events(cfg: ManagerBasedRlEnvCfg, *, play: bool) -> None:
+def configure_events(
+    cfg: ManagerBasedRlEnvCfg,
+    *,
+    play: bool,
+    phase: Literal["base", "stand", "turn", "arc"] = "base",
+) -> None:
     """从对称名义姿态起步，再逐步扩大初始关节扰动。"""
     if play:
         return
@@ -45,6 +52,16 @@ def configure_events(cfg: ManagerBasedRlEnvCfg, *, play: bool) -> None:
                 ],
             }
         )
+        if phase in {"stand", "turn", "arc"}:
+            reset_root_cfg.params["recovery_prob"] = 0.15 if phase != "turn" else 0.10
+            reset_root_cfg.params["recovery_stages"] = [
+                {
+                    "step": 0,
+                    "prob": reset_root_cfg.params["recovery_prob"],
+                    "roll_range": (-0.035, 0.035),
+                    "pitch_range": (-0.087, 0.087),
+                }
+            ]
 
     reset_joints_cfg = cfg.events.get("reset_joints")
     if reset_joints_cfg is not None:
@@ -77,6 +94,15 @@ def configure_events(cfg: ManagerBasedRlEnvCfg, *, play: bool) -> None:
                 ],
             }
         )
+        if phase in {"stand", "turn", "arc"}:
+            reset_joints_cfg.params["curriculum_stages"] = [
+                {
+                    "iteration": 0,
+                    "full_joint_randomization": False,
+                    "joint_offset_range": 0.02,
+                    "joint_vel_range": (-0.08, 0.08),
+                }
+            ]
 
     # 名义物理阶段仍保留域随机化，但避免宽扰动掩盖基本轮轴动力学。
     randomization_params = {

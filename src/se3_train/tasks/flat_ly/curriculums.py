@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -19,6 +19,7 @@ _STAGE_START_STEP_ATTR = "_flat_ly_physical_stage_start_step"
 _YAW_MAX_ATTR = "_flat_ly_physical_yaw_max"
 _YAW_EMA_ATTR = "_flat_ly_physical_yaw_ema"
 _YAW_STAGE_START_STEP_ATTR = "_flat_ly_physical_yaw_stage_start_step"
+_YAW_STAGE_INDEX_ATTR = "_flat_ly_yaw_stage_index"
 
 
 def commands_vel_physical(
@@ -134,36 +135,169 @@ def commands_vel_physical(
     }
 
 
-def configure_curriculums(cfg: ManagerBasedRlEnvCfg, *, play: bool) -> None:
+def commands_yaw_staged(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    yaw_stages: tuple[float, ...],
+    advance_threshold: float = 0.60,
+    ema_alpha: float = 0.05,
+    min_stage_iterations: int = 200,
+    steps_per_policy_iter: int = 64,
+) -> dict[str, torch.Tensor]:
+    """正负方向同时达标后，按显式档位逐步扩大高速 yaw-rate。"""
+    del env_ids
+    term = env.command_manager.get_term(command_name)
+    cfg: VelocityHeightCommandCfg = term.cfg  # type: ignore[assignment]
+    stages = tuple(sorted({abs(float(value)) for value in yaw_stages if float(value) > 0.0}))
+    if not stages:
+        raise ValueError("yaw_stages 必须包含至少一个正数档位")
+
+    common_step = int(getattr(env, "common_step_counter", 0))
+    if not hasattr(env, _YAW_STAGE_INDEX_ATTR):
+        setattr(env, _YAW_STAGE_INDEX_ATTR, 0)
+        setattr(env, _YAW_EMA_ATTR, 0.0)
+        setattr(env, _YAW_STAGE_START_STEP_ATTR, common_step)
+
+    stage_index = min(int(getattr(env, _YAW_STAGE_INDEX_ATTR)), len(stages) - 1)
+    yaw_ema = float(getattr(env, _YAW_EMA_ATTR))
+    stage_start_step = int(getattr(env, _YAW_STAGE_START_STEP_ATTR))
+    min_stage_steps = max(0, int(min_stage_iterations)) * max(1, int(steps_per_policy_iter))
+    dwell_progress = min(
+        max((common_step - stage_start_step) / max(float(min_stage_steps), 1.0), 0.0),
+        1.0,
+    )
+
+    log = getattr(env, "extras", {}).get("log", {})
+    positive_score = log.get("Locomotion/flat_ly_course_yaw_positive_score")
+    negative_score = log.get("Locomotion/flat_ly_course_yaw_negative_score")
+    if positive_score is not None and negative_score is not None:
+        physical_score = min(float(positive_score), float(negative_score))
+        alpha = min(max(float(ema_alpha), 0.0), 1.0)
+        yaw_ema = (1.0 - alpha) * yaw_ema + alpha * physical_score
+        if (
+            yaw_ema > float(advance_threshold)
+            and dwell_progress >= 1.0
+            and stage_index < len(stages) - 1
+        ):
+            stage_index += 1
+            yaw_ema = 0.0
+            stage_start_step = common_step
+            dwell_progress = 0.0
+        setattr(env, _YAW_STAGE_INDEX_ATTR, stage_index)
+        setattr(env, _YAW_EMA_ATTR, yaw_ema)
+        setattr(env, _YAW_STAGE_START_STEP_ATTR, stage_start_step)
+    else:
+        physical_score = float("nan")
+
+    yaw_max = stages[stage_index]
+    cfg.ang_vel_yaw_range = (-yaw_max, yaw_max)
+    return {
+        "ang_vel_yaw_max": torch.tensor(yaw_max, device=env.device),
+        "yaw_stage_index": torch.tensor(float(stage_index), device=env.device),
+        "yaw_ema": torch.tensor(yaw_ema, device=env.device),
+        "yaw_stage_dwell_progress": torch.tensor(dwell_progress, device=env.device),
+        "yaw_physical_score": torch.tensor(physical_score, device=env.device),
+    }
+
+
+def configure_curriculums(
+    cfg: ManagerBasedRlEnvCfg,
+    *,
+    play: bool,
+    phase: Literal["base", "stand", "turn", "arc"] = "base",
+) -> None:
     """使用综合物理稳定分数扩展直线速度课程。"""
     if play:
         return
 
-    command_vel_cfg = cfg.curriculum["command_vel"]
-    command_vel_cfg.func = commands_vel_physical
-    command_vel_cfg.params.clear()
-    command_vel_cfg.params.update(
-        {
-            "command_name": "velocity_height",
-            "lin_vel_x_step": 0.2,
-            "max_lin_vel_x": 2.0,
-            "init_lin_vel_x": 0.2,
-            "ang_vel_yaw_step": 0.1,
-            "max_ang_vel_yaw": 0.3,
-            "init_ang_vel_yaw": 0.1,
-            "advance_threshold": 0.65,
-            "yaw_advance_threshold": 0.65,
-            "ema_alpha": 0.05,
-            "min_stage_iterations": 100,
-            "yaw_min_stage_iterations": 300,
-            "steps_per_policy_iter": 64,
-        }
-    )
+    command_vel_cfg = cfg.curriculum.get("command_vel")
+    if phase == "stand":
+        cfg.curriculum.pop("command_vel", None)
+    elif phase in {"turn", "arc"} and command_vel_cfg is not None:
+        command_vel_cfg.func = commands_yaw_staged
+        command_vel_cfg.params.clear()
+        command_vel_cfg.params.update(
+            {
+                "command_name": "velocity_height",
+                "yaw_stages": (0.3, 0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0),
+                "advance_threshold": 0.60,
+                "ema_alpha": 0.05,
+                "min_stage_iterations": 200 if phase == "turn" else 50,
+                "steps_per_policy_iter": 64,
+            }
+        )
+    elif command_vel_cfg is not None:
+        command_vel_cfg.func = commands_vel_physical
+        command_vel_cfg.params.clear()
+        command_vel_cfg.params.update(
+            {
+                "command_name": "velocity_height",
+                "lin_vel_x_step": 0.2,
+                "max_lin_vel_x": 2.0,
+                "init_lin_vel_x": 0.2,
+                "ang_vel_yaw_step": 0.1,
+                "max_ang_vel_yaw": 0.3,
+                "init_ang_vel_yaw": 0.1,
+                "advance_threshold": 0.65,
+                "yaw_advance_threshold": 0.65,
+                "ema_alpha": 0.05,
+                "min_stage_iterations": 100,
+                "yaw_min_stage_iterations": 300,
+                "steps_per_policy_iter": 64,
+            }
+        )
 
     push_cfg = cfg.curriculum.get("push_disturbance")
     if push_cfg is not None:
-        push_cfg.params["push_stages"] = [
-            {"iteration": 0, "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0)}},
-            {"iteration": 3000, "velocity_range": {"x": (-0.2, 0.2), "y": (-0.2, 0.2)}},
-            {"iteration": 6000, "velocity_range": {"x": (-0.4, 0.4), "y": (-0.4, 0.4)}},
-        ]
+        if phase == "stand":
+            push_cfg.params.update(
+                {
+                    "use_iterations": True,
+                    "fixed_iteration": 0,
+                    "push_stages": [
+                        {
+                            "iteration": 0,
+                            "velocity_range": {"x": (-0.10, 0.10), "y": (-0.05, 0.05)},
+                        }
+                    ],
+                }
+            )
+        elif phase == "turn":
+            push_cfg.params.update(
+                {
+                    "use_iterations": True,
+                    "fixed_iteration": 0,
+                    "push_stages": [
+                        {
+                            "iteration": 0,
+                            "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0)},
+                        }
+                    ],
+                }
+            )
+        elif phase == "arc":
+            push_cfg.params.update(
+                {
+                    "use_iterations": True,
+                    "fixed_iteration": 0,
+                    "push_stages": [
+                        {
+                            "iteration": 0,
+                            "velocity_range": {"x": (-0.10, 0.10), "y": (-0.10, 0.10)},
+                        }
+                    ],
+                }
+            )
+        else:
+            push_cfg.params["push_stages"] = [
+                {"iteration": 0, "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0)}},
+                {
+                    "iteration": 3000,
+                    "velocity_range": {"x": (-0.2, 0.2), "y": (-0.2, 0.2)},
+                },
+                {
+                    "iteration": 6000,
+                    "velocity_range": {"x": (-0.4, 0.4), "y": (-0.4, 0.4)},
+                },
+            ]

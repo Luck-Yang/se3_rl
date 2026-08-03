@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from mjlab.envs import ManagerBasedRlEnvCfg
 
 from se3_train.tasks.flat.env_cfg import env_cfg as flat_env_cfg
@@ -9,17 +11,20 @@ from se3_train.tasks.flat.env_cfg import env_cfg as flat_env_cfg
 from . import actions, commands, curriculums, events, observations, rewards, terminations
 
 
-def env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+def env_cfg(
+    play: bool = False,
+    phase: Literal["base", "stand", "turn", "arc"] = "base",
+) -> ManagerBasedRlEnvCfg:
     """组装 flat_ly 环境，并把各类 MDP 配置交给本目录的学习接口。"""
     cfg = flat_env_cfg(play=play)
 
     observations.configure_observations(cfg, play=play)
     actions.configure_actions(cfg)
-    commands.configure_commands(cfg, play=play)
-    rewards.configure_rewards(cfg)
+    commands.configure_commands(cfg, play=play, phase=phase)
+    rewards.configure_rewards(cfg, phase=phase)
     terminations.configure_terminations(cfg, play=play)
-    curriculums.configure_curriculums(cfg, play=play)
-    events.configure_events(cfg, play=play)
+    curriculums.configure_curriculums(cfg, play=play, phase=phase)
+    events.configure_events(cfg, play=play, phase=phase)
 
     if not play:
         # 20 s 后才出现的慢性漂移必须留在同一 episode 内被奖励看见。
