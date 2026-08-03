@@ -95,12 +95,6 @@ def _smooth_bounded_square(raw_penalty: torch.Tensor, max_penalty: float) -> tor
     return limit * torch.tanh(raw_penalty / limit)
 
 
-def _smooth_rational_bound(raw_penalty: torch.Tensor, max_penalty: float) -> torch.Tensor:
-    """用有理函数限制惩罚，并在大误差区保留缓慢恢复斜率。"""
-    limit = max(float(max_penalty), 1.0e-6)
-    return limit * raw_penalty / (limit + raw_penalty)
-
-
 def dynamic_pitch_penalty(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -360,42 +354,56 @@ def standing_stationkeeping_reward(
     return score
 
 
-def standing_low_frequency_drift_penalty(
+def _standing_low_frequency_motion_values(
     env: ManagerBasedRlEnv,
     command_name: str,
     tau_s: float = 0.75,
     base_deadband: float = 0.01,
     base_scale: float = 0.05,
-    wheel_deadband: float = 0.03,
-    wheel_scale: float = 0.10,
-    wheel_weight: float = 0.25,
+    base_weight: float = 0.25,
+    wheel_deadband: float = 0.01,
+    wheel_scale: float = 0.05,
+    wheel_weight: float = 1.0,
+    yaw_deadband: float = 0.01,
+    yaw_scale: float = 0.05,
+    yaw_weight: float = 1.0,
     max_penalty: float = 4.0,
-) -> torch.Tensor:
-    """平滑有界地惩罚静站低频偏置，同时允许轮子高频往复纠偏。"""
+) -> dict[str, torch.Tensor]:
+    """返回静站低频轮面平移、yaw-rate 和机身速度零偏指标。"""
     robot = env.scene["robot"]
     standing = _standing_mask(env, command_name)
     wheel_vel = robot.data.joint_vel[:, wheel_joint_ids(robot)]
     wheel_forward = 0.5 * (wheel_vel[:, 0] * 0.059 - wheel_vel[:, 1] * 0.059)
     base_vx = robot.data.root_link_lin_vel_b[:, 0]
+    yaw_rate = robot.data.root_link_ang_vel_b[:, 2]
 
     base_ema = getattr(env, "_flat_ly_stand_base_vx_ema", None)
     wheel_ema = getattr(env, "_flat_ly_stand_wheel_vx_ema", None)
+    yaw_ema = getattr(env, "_flat_ly_stand_yaw_rate_ema", None)
     if not isinstance(base_ema, torch.Tensor) or base_ema.shape[0] != env.num_envs:
         base_ema = torch.zeros(env.num_envs, device=env.device)
         wheel_ema = torch.zeros(env.num_envs, device=env.device)
+        yaw_ema = torch.zeros(env.num_envs, device=env.device)
         env._flat_ly_stand_base_vx_ema = base_ema
         env._flat_ly_stand_wheel_vx_ema = wheel_ema
+        env._flat_ly_stand_yaw_rate_ema = yaw_ema
     assert isinstance(wheel_ema, torch.Tensor)
+    assert isinstance(yaw_ema, torch.Tensor)
 
-    dt = max(float(getattr(env, "step_dt", 0.02)), 1.0e-6)
-    alpha = 1.0 - math.exp(-dt / max(float(tau_s), dt))
-    reset_mask = env.episode_length_buf <= 1
-    # 非静站阶段不积累历史，运动指令切回静站时从零开始估计长期偏置。
-    clear_mask = reset_mask | ~standing
-    base_ema[clear_mask] = 0.0
-    wheel_ema[clear_mask] = 0.0
-    base_ema.lerp_(torch.where(standing, base_vx, torch.zeros_like(base_vx)), alpha)
-    wheel_ema.lerp_(torch.where(standing, wheel_forward, torch.zeros_like(wheel_forward)), alpha)
+    current_step = int(getattr(env, "common_step_counter", 0))
+    if getattr(env, "_flat_ly_stand_motion_ema_step", -1) != current_step:
+        dt = max(float(getattr(env, "step_dt", 0.02)), 1.0e-6)
+        alpha = 1.0 - math.exp(-dt / max(float(tau_s), dt))
+        reset_mask = env.episode_length_buf <= 1
+        # 非静站阶段不积累历史，下一次静站从零偏重新估计。
+        clear_mask = reset_mask | ~standing
+        base_ema[clear_mask] = 0.0
+        wheel_ema[clear_mask] = 0.0
+        yaw_ema[clear_mask] = 0.0
+        base_ema.lerp_(torch.where(standing, base_vx, torch.zeros_like(base_vx)), alpha)
+        wheel_ema.lerp_(torch.where(standing, wheel_forward, torch.zeros_like(wheel_forward)), alpha)
+        yaw_ema.lerp_(torch.where(standing, yaw_rate, torch.zeros_like(yaw_rate)), alpha)
+        env._flat_ly_stand_motion_ema_step = current_step
 
     base_penalty_raw = torch.square(
         torch.clamp(torch.abs(base_ema) - float(base_deadband), min=0.0)
@@ -405,122 +413,73 @@ def standing_low_frequency_drift_penalty(
         torch.clamp(torch.abs(wheel_ema) - float(wheel_deadband), min=0.0)
         / max(float(wheel_scale), 1.0e-6)
     )
-    raw_penalty = base_penalty_raw + float(wheel_weight) * wheel_penalty_raw
+    yaw_penalty_raw = torch.square(
+        torch.clamp(torch.abs(yaw_ema) - float(yaw_deadband), min=0.0)
+        / max(float(yaw_scale), 1.0e-6)
+    )
+    observable_raw = (
+        float(wheel_weight) * wheel_penalty_raw + float(yaw_weight) * yaw_penalty_raw
+    )
+    raw_penalty = float(base_weight) * base_penalty_raw + observable_raw
     penalty = _smooth_bounded_square(raw_penalty, max_penalty) * standing.float()
+    score = torch.exp(-observable_raw) * standing.float()
+    return {
+        "penalty": penalty,
+        "score": score,
+        "standing": standing,
+        "base_ema": base_ema,
+        "wheel_ema": wheel_ema,
+        "yaw_ema": yaw_ema,
+        "raw_penalty": raw_penalty,
+        "observable_raw": observable_raw,
+    }
+
+
+def standing_low_frequency_motion_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    **params: float,
+) -> torch.Tensor:
+    """惩罚静站可观测运动量的持续有符号零偏。"""
+    values = _standing_low_frequency_motion_values(env, command_name, **params)
+    standing = values["standing"].bool()
     if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
         env.extras.setdefault("log", {}).update(
             {
                 "Locomotion/flat_ly_stand_base_vx_ema_abs": _masked_mean(
-                    torch.abs(base_ema), standing
+                    torch.abs(values["base_ema"]), standing
                 ).item(),
                 "Locomotion/flat_ly_stand_wheel_vx_ema_abs": _masked_mean(
-                    torch.abs(wheel_ema), standing
+                    torch.abs(values["wheel_ema"]), standing
+                ).item(),
+                "Locomotion/flat_ly_stand_yaw_rate_ema_abs": _masked_mean(
+                    torch.abs(values["yaw_ema"]), standing
                 ).item(),
                 "Locomotion/flat_ly_stand_low_frequency_penalty": _masked_mean(
-                    penalty, standing
+                    values["penalty"], standing
                 ).item(),
                 "Locomotion/flat_ly_stand_low_frequency_raw_penalty": _masked_mean(
-                    raw_penalty, standing
+                    values["raw_penalty"], standing
+                ).item(),
+                "Locomotion/flat_ly_stand_observable_motion_raw": _masked_mean(
+                    values["observable_raw"], standing
+                ).item(),
+                "Locomotion/flat_ly_stand_observable_motion_score": _masked_mean(
+                    values["score"], standing
                 ).item(),
             }
         )
-    return penalty
+    return values["penalty"]
 
 
-def _standing_position_anchor_values(
+def standing_low_frequency_motion_reward(
     env: ManagerBasedRlEnv,
     command_name: str,
-    position_deadband: float,
-    position_scale: float,
-    max_penalty: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """记录静站世界坐标锚点，并返回位移惩罚、奖励及诊断量。"""
-    robot = env.scene["robot"]
-    standing = _standing_mask(env, command_name)
-    recovery_active = recovery_state.recovery_active_mask(env)
-    active_standing = standing & ~recovery_active
-    position_xy = robot.data.root_link_pos_w[:, :2]
-
-    anchor_xy = getattr(env, "_flat_ly_stand_anchor_xy", None)
-    anchor_active = getattr(env, "_flat_ly_stand_anchor_active", None)
-    if not isinstance(anchor_xy, torch.Tensor) or anchor_xy.shape != (env.num_envs, 2):
-        anchor_xy = torch.zeros((env.num_envs, 2), device=env.device)
-        anchor_active = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
-        env._flat_ly_stand_anchor_xy = anchor_xy
-        env._flat_ly_stand_anchor_active = anchor_active
-    assert isinstance(anchor_active, torch.Tensor)
-
-    reset_mask = env.episode_length_buf <= 1
-    anchor_active[reset_mask | ~active_standing] = False
-    entering_stand = active_standing & ~anchor_active
-    anchor_xy[entering_stand] = position_xy[entering_stand]
-    anchor_active[entering_stand] = True
-
-    offset_xy = position_xy - anchor_xy
-    distance = torch.linalg.vector_norm(offset_xy, dim=1)
-    excess = torch.clamp(distance - float(position_deadband), min=0.0)
-    raw_penalty = torch.square(excess / max(float(position_scale), 1.0e-6))
-    penalty = _smooth_rational_bound(raw_penalty, max_penalty) * active_standing.float()
-    score = torch.exp(-raw_penalty) * active_standing.float()
-    return penalty, score, active_standing, offset_xy, raw_penalty
-
-
-def standing_position_anchor_penalty(
-    env: ManagerBasedRlEnv,
-    command_name: str,
-    position_deadband: float = 0.02,
-    position_scale: float = 0.10,
-    max_penalty: float = 6.0,
+    **params: float,
 ) -> torch.Tensor:
-    """惩罚静站起点后的累计平面位移，但不限制瞬时轮速。"""
-    penalty, score, active, offset_xy, raw_penalty = _standing_position_anchor_values(
-        env,
-        command_name,
-        position_deadband,
-        position_scale,
-        max_penalty,
-    )
-    if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
-        distance = torch.linalg.vector_norm(offset_xy, dim=1)
-        env.extras.setdefault("log", {}).update(
-            {
-                "Locomotion/flat_ly_stand_anchor_distance_m": _masked_mean(
-                    distance, active
-                ).item(),
-                "Locomotion/flat_ly_stand_anchor_x_abs_m": _masked_mean(
-                    torch.abs(offset_xy[:, 0]), active
-                ).item(),
-                "Locomotion/flat_ly_stand_anchor_y_abs_m": _masked_mean(
-                    torch.abs(offset_xy[:, 1]), active
-                ).item(),
-                "Locomotion/flat_ly_stand_anchor_raw_penalty": _masked_mean(
-                    raw_penalty, active
-                ).item(),
-                "Locomotion/flat_ly_stand_anchor_penalty": _masked_mean(
-                    penalty, active
-                ).item(),
-                "Locomotion/flat_ly_stand_anchor_score": _masked_mean(score, active).item(),
-            }
-        )
-    return penalty
-
-
-def standing_position_anchor_reward(
-    env: ManagerBasedRlEnv,
-    command_name: str,
-    position_deadband: float = 0.02,
-    position_scale: float = 0.10,
-    max_penalty: float = 6.0,
-) -> torch.Tensor:
-    """奖励机身长期保持在静站锚点附近。"""
-    _, score, _, _, _ = _standing_position_anchor_values(
-        env,
-        command_name,
-        position_deadband,
-        position_scale,
-        max_penalty,
-    )
-    return score
+    """奖励静站轮面平移和 yaw-rate 的长期均值接近零。"""
+    values = _standing_low_frequency_motion_values(env, command_name, **params)
+    return values["score"]
 
 
 def _wheel_body_ids(env: ManagerBasedRlEnv) -> list[int]:
@@ -863,25 +822,33 @@ def physical_stability_reward(
     )
     zero_speed_score = torch.exp(-zero_speed_penalty)
     _, standing_stationkeeping_score, _ = _standing_stationkeeping_values(env, command_name)
-    standing_anchor_score = torch.ones_like(standing_stationkeeping_score)
-    if "standing_position_anchor_penalty" in env.reward_manager.active_terms:
-        _, anchor_score, anchor_active, _, _ = _standing_position_anchor_values(
+    standing_motion_score = torch.ones_like(standing_stationkeeping_score)
+    if "standing_low_frequency_motion_reward" in env.reward_manager.active_terms:
+        motion_values = _standing_low_frequency_motion_values(
             env,
             command_name,
-            position_deadband=0.02,
-            position_scale=0.10,
-            max_penalty=6.0,
+            tau_s=0.75,
+            base_deadband=0.01,
+            base_scale=0.05,
+            base_weight=0.25,
+            wheel_deadband=0.01,
+            wheel_scale=0.05,
+            wheel_weight=1.0,
+            yaw_deadband=0.01,
+            yaw_scale=0.05,
+            yaw_weight=1.0,
+            max_penalty=4.0,
         )
-        standing_anchor_score = torch.where(
-            anchor_active,
-            anchor_score,
-            standing_anchor_score,
+        standing_motion_score = torch.where(
+            standing_mask,
+            motion_values["score"],
+            standing_motion_score,
         )
     standing_per_env = (
         torch.stack(
             (
                 standing_stationkeeping_score,
-                standing_anchor_score,
+                standing_motion_score,
                 load_score,
                 rolling_score,
             ),
@@ -1262,35 +1229,29 @@ def configure_rewards(
     )
 
     if phase in {"stand", "turn", "arc"}:
-        cfg.rewards["standing_low_frequency_drift"] = RewardTermCfg(
-            func=standing_low_frequency_drift_penalty,
-            weight=-5.0 if phase == "stand" else -2.0,
-            params={
-                "command_name": "velocity_height",
-                "tau_s": 0.75,
-                "base_deadband": 0.01,
-                "base_scale": 0.05,
-                "wheel_deadband": 0.03,
-                "wheel_scale": 0.10,
-                "wheel_weight": 0.25,
-                "max_penalty": 4.0,
-            },
-        )
-        anchor_params = {
+        motion_params = {
             "command_name": "velocity_height",
-            "position_deadband": 0.02,
-            "position_scale": 0.10,
-            "max_penalty": 6.0,
+            "tau_s": 0.75,
+            "base_deadband": 0.01,
+            "base_scale": 0.05,
+            "base_weight": 0.25,
+            "wheel_deadband": 0.01,
+            "wheel_scale": 0.05,
+            "wheel_weight": 1.0,
+            "yaw_deadband": 0.01,
+            "yaw_scale": 0.05,
+            "yaw_weight": 1.0,
+            "max_penalty": 4.0,
         }
-        cfg.rewards["standing_position_anchor_penalty"] = RewardTermCfg(
-            func=standing_position_anchor_penalty,
-            weight=-3.0 if phase == "stand" else -1.5,
-            params=anchor_params.copy(),
+        cfg.rewards["standing_low_frequency_motion_penalty"] = RewardTermCfg(
+            func=standing_low_frequency_motion_penalty,
+            weight=-5.0 if phase == "stand" else -2.0,
+            params=motion_params.copy(),
         )
-        cfg.rewards["standing_position_anchor_reward"] = RewardTermCfg(
-            func=standing_position_anchor_reward,
-            weight=3.0 if phase == "stand" else 1.5,
-            params=anchor_params.copy(),
+        cfg.rewards["standing_low_frequency_motion_reward"] = RewardTermCfg(
+            func=standing_low_frequency_motion_reward,
+            weight=4.0 if phase == "stand" else 1.5,
+            params=motion_params.copy(),
         )
 
     if phase == "stand":

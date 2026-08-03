@@ -33,7 +33,7 @@ def register() -> None:
             task_id=task_id,
             env_cfg=env_cfg(phase=phase),
             play_env_cfg=env_cfg(play=True, phase=phase),
-            rl_cfg=rl_cfg(),
+            rl_cfg=rl_cfg(phase=phase),
             runner_cls=Se3ProfiledOnPolicyRunner,
         )
 
