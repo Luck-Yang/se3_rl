@@ -95,6 +95,12 @@ def _smooth_bounded_square(raw_penalty: torch.Tensor, max_penalty: float) -> tor
     return limit * torch.tanh(raw_penalty / limit)
 
 
+def _smooth_rational_bound(raw_penalty: torch.Tensor, max_penalty: float) -> torch.Tensor:
+    """用有理函数限制惩罚，并在大误差区保留缓慢恢复斜率。"""
+    limit = max(float(max_penalty), 1.0e-6)
+    return limit * raw_penalty / (limit + raw_penalty)
+
+
 def dynamic_pitch_penalty(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -419,6 +425,102 @@ def standing_low_frequency_drift_penalty(
             }
         )
     return penalty
+
+
+def _standing_position_anchor_values(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    position_deadband: float,
+    position_scale: float,
+    max_penalty: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """记录静站世界坐标锚点，并返回位移惩罚、奖励及诊断量。"""
+    robot = env.scene["robot"]
+    standing = _standing_mask(env, command_name)
+    recovery_active = recovery_state.recovery_active_mask(env)
+    active_standing = standing & ~recovery_active
+    position_xy = robot.data.root_link_pos_w[:, :2]
+
+    anchor_xy = getattr(env, "_flat_ly_stand_anchor_xy", None)
+    anchor_active = getattr(env, "_flat_ly_stand_anchor_active", None)
+    if not isinstance(anchor_xy, torch.Tensor) or anchor_xy.shape != (env.num_envs, 2):
+        anchor_xy = torch.zeros((env.num_envs, 2), device=env.device)
+        anchor_active = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+        env._flat_ly_stand_anchor_xy = anchor_xy
+        env._flat_ly_stand_anchor_active = anchor_active
+    assert isinstance(anchor_active, torch.Tensor)
+
+    reset_mask = env.episode_length_buf <= 1
+    anchor_active[reset_mask | ~active_standing] = False
+    entering_stand = active_standing & ~anchor_active
+    anchor_xy[entering_stand] = position_xy[entering_stand]
+    anchor_active[entering_stand] = True
+
+    offset_xy = position_xy - anchor_xy
+    distance = torch.linalg.vector_norm(offset_xy, dim=1)
+    excess = torch.clamp(distance - float(position_deadband), min=0.0)
+    raw_penalty = torch.square(excess / max(float(position_scale), 1.0e-6))
+    penalty = _smooth_rational_bound(raw_penalty, max_penalty) * active_standing.float()
+    score = torch.exp(-raw_penalty) * active_standing.float()
+    return penalty, score, active_standing, offset_xy, raw_penalty
+
+
+def standing_position_anchor_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    position_deadband: float = 0.02,
+    position_scale: float = 0.10,
+    max_penalty: float = 6.0,
+) -> torch.Tensor:
+    """惩罚静站起点后的累计平面位移，但不限制瞬时轮速。"""
+    penalty, score, active, offset_xy, raw_penalty = _standing_position_anchor_values(
+        env,
+        command_name,
+        position_deadband,
+        position_scale,
+        max_penalty,
+    )
+    if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
+        distance = torch.linalg.vector_norm(offset_xy, dim=1)
+        env.extras.setdefault("log", {}).update(
+            {
+                "Locomotion/flat_ly_stand_anchor_distance_m": _masked_mean(
+                    distance, active
+                ).item(),
+                "Locomotion/flat_ly_stand_anchor_x_abs_m": _masked_mean(
+                    torch.abs(offset_xy[:, 0]), active
+                ).item(),
+                "Locomotion/flat_ly_stand_anchor_y_abs_m": _masked_mean(
+                    torch.abs(offset_xy[:, 1]), active
+                ).item(),
+                "Locomotion/flat_ly_stand_anchor_raw_penalty": _masked_mean(
+                    raw_penalty, active
+                ).item(),
+                "Locomotion/flat_ly_stand_anchor_penalty": _masked_mean(
+                    penalty, active
+                ).item(),
+                "Locomotion/flat_ly_stand_anchor_score": _masked_mean(score, active).item(),
+            }
+        )
+    return penalty
+
+
+def standing_position_anchor_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    position_deadband: float = 0.02,
+    position_scale: float = 0.10,
+    max_penalty: float = 6.0,
+) -> torch.Tensor:
+    """奖励机身长期保持在静站锚点附近。"""
+    _, score, _, _, _ = _standing_position_anchor_values(
+        env,
+        command_name,
+        position_deadband,
+        position_scale,
+        max_penalty,
+    )
+    return score
 
 
 def _wheel_body_ids(env: ManagerBasedRlEnv) -> list[int]:
@@ -761,10 +863,25 @@ def physical_stability_reward(
     )
     zero_speed_score = torch.exp(-zero_speed_penalty)
     _, standing_stationkeeping_score, _ = _standing_stationkeeping_values(env, command_name)
+    standing_anchor_score = torch.ones_like(standing_stationkeeping_score)
+    if "standing_position_anchor_penalty" in env.reward_manager.active_terms:
+        _, anchor_score, anchor_active, _, _ = _standing_position_anchor_values(
+            env,
+            command_name,
+            position_deadband=0.02,
+            position_scale=0.10,
+            max_penalty=6.0,
+        )
+        standing_anchor_score = torch.where(
+            anchor_active,
+            anchor_score,
+            standing_anchor_score,
+        )
     standing_per_env = (
         torch.stack(
             (
                 standing_stationkeeping_score,
+                standing_anchor_score,
                 load_score,
                 rolling_score,
             ),
@@ -1158,6 +1275,22 @@ def configure_rewards(
                 "wheel_weight": 0.25,
                 "max_penalty": 4.0,
             },
+        )
+        anchor_params = {
+            "command_name": "velocity_height",
+            "position_deadband": 0.02,
+            "position_scale": 0.10,
+            "max_penalty": 6.0,
+        }
+        cfg.rewards["standing_position_anchor_penalty"] = RewardTermCfg(
+            func=standing_position_anchor_penalty,
+            weight=-3.0 if phase == "stand" else -1.5,
+            params=anchor_params.copy(),
+        )
+        cfg.rewards["standing_position_anchor_reward"] = RewardTermCfg(
+            func=standing_position_anchor_reward,
+            weight=3.0 if phase == "stand" else 1.5,
+            params=anchor_params.copy(),
         )
 
     if phase == "stand":
