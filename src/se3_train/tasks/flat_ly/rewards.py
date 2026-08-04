@@ -129,6 +129,18 @@ def _smooth_bounded_square(raw_penalty: torch.Tensor, max_penalty: float) -> tor
     return limit * torch.tanh(raw_penalty / limit)
 
 
+def _scaled_deadband_huber(
+    error: torch.Tensor,
+    *,
+    deadband: float,
+    scale: float,
+) -> torch.Tensor:
+    """返回死区外先平方、随后线性增长且不饱和的姿态惩罚。"""
+    excess = torch.clamp(torch.abs(error) - float(deadband), min=0.0)
+    normalized = excess / max(float(scale), 1.0e-6)
+    return torch.where(normalized <= 1.0, torch.square(normalized), 2.0 * normalized - 1.0)
+
+
 def dynamic_pitch_penalty(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -136,16 +148,14 @@ def dynamic_pitch_penalty(
     max_pitch_deg: float = 3.0,
     deadband_deg: float = 1.5,
     scale_deg: float = 4.0,
-    max_penalty: float = 9.0,
 ) -> torch.Tensor:
-    """惩罚 pitch 偏离指令加速度前馈目标，恒速和静站目标均为零。"""
+    """惩罚 pitch 偏离前馈目标，大偏角保持线性区分度而不硬截断。"""
     state = _orientation_state(env, command_name, max_accel, max_pitch_deg)
     error = state["pitch"] - state["pitch_ref"]
-    penalty = _scaled_deadband_square(
+    penalty = _scaled_deadband_huber(
         error,
         deadband=math.radians(float(deadband_deg)),
         scale=math.radians(float(scale_deg)),
-        max_penalty=max_penalty,
     )
 
     if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
@@ -173,15 +183,13 @@ def roll_stability_penalty(
     command_name: str,
     deadband_deg: float = 2.0,
     scale_deg: float = 5.0,
-    max_penalty: float = 9.0,
 ) -> torch.Tensor:
-    """惩罚超出误差死区的 roll，平地直行时目标为零。"""
+    """惩罚超出误差死区的 roll，并让大偏角继续产生更坏的回报。"""
     state = _orientation_state(env, command_name, 0.5, 3.0)
-    return _scaled_deadband_square(
+    return _scaled_deadband_huber(
         state["roll"],
         deadband=math.radians(float(deadband_deg)),
         scale=math.radians(float(scale_deg)),
-        max_penalty=max_penalty,
     )
 
 
@@ -1173,7 +1181,6 @@ def configure_rewards(
                     "max_pitch_deg": 3.0,
                     "deadband_deg": 1.5,
                     "scale_deg": 4.0,
-                    "max_penalty": 9.0,
                 },
             ),
             "roll_stability": RewardTermCfg(
@@ -1183,7 +1190,6 @@ def configure_rewards(
                     "command_name": "velocity_height",
                     "deadband_deg": 2.0,
                     "scale_deg": 5.0,
-                    "max_penalty": 9.0,
                 },
             ),
             "ang_vel_xy": RewardTermCfg(
@@ -1308,11 +1314,11 @@ def configure_rewards(
             ),
             "action_rate": RewardTermCfg(
                 func=mdp_rewards.action_rate,
-                weight=-0.1,
+                weight=-0.5,
             ),
             "action_smoothness": RewardTermCfg(
                 func=mdp_rewards.action_smoothness,
-                weight=-0.01,
+                weight=-0.05,
                 params={"command_name": "velocity_height"},
             ),
             "dof_pos_limits": RewardTermCfg(

@@ -6,4 +6,6 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 
 
 def configure_actions(cfg: ManagerBasedRlEnvCfg) -> None:
-    """修改 ``cfg.actions``；当前完整沿用 flat 的 6 维延迟动作配置。"""
+    """让训练端动作零点与 sim2sim 的高度条件腿型保持一致。"""
+    action_cfg = cfg.actions["delayed_action"]
+    action_cfg.height_conditioned_action_default = True

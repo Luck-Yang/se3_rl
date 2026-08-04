@@ -17,10 +17,22 @@ def rl_cfg(
     """沿用 flat 的 PPO/GRU 参数，并使用独立实验目录保存训练结果。"""
     cfg = flat_rl_cfg(smoke=smoke)
     cfg.experiment_name = "se3_wheel_leg_flat_ly"
+    # RSL-RL adaptive schedule 每个 mini-batch 都可能把学习率放大 1.5 倍，默认
+    # 上限高达 1e-2。model0 第一轮使用 7x4 次更新时会直接撞到该上限并破坏姿态。
+    cfg.algorithm.class_name = "se3_train.tasks.flat_ly.ppo:FlatLyBoundedPPO"
+    cfg.algorithm.learning_rate = 1.0e-4
+    cfg.algorithm.desired_kl = 0.006
+    cfg.algorithm.clip_param = 0.10
+    cfg.algorithm.num_learning_epochs = 5
+    cfg.algorithm.max_grad_norm = 0.5
+    if phase == "base":
+        # 第 0 轮从 2e-5 起步，此后跨 iteration 逐步增长，约第 6 轮达到 2e-4 上限。
+        cfg.algorithm.class_name = "se3_train.tasks.flat_ly.ppo:FlatLyBasePPO"
     # 所有入口默认随机初始化。只有阶段流水线显式传入 resume/load-run/checkpoint 时才 warm-start。
     cfg.resume = False
     if phase == "stand":
         # 静站属于已有策略的精修，降低更新幅度与熵压力，避免后期重新放大动作抖动。
+        cfg.algorithm.class_name = "se3_train.tasks.flat_ly.ppo:FlatLyFineTunePPO"
         cfg.actor.distribution_cfg["init_std"] = 0.20
         cfg.algorithm.learning_rate = 5.0e-5
         cfg.algorithm.entropy_coef = 1.0e-3
