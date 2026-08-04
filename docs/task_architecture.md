@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `rough/` | `SE3-WheelLegged-Rough` | 崎岖地形行走任务 |
 | `flat/` | `SE3-WheelLegged-Flat-GRU` | 平地行走 GRU 基模 |
-| `flat_ly/` | `SE3-WheelLegged-Flat-LY-GRU` | 基于 flat、奖励留空的完整训练流程学习任务 |
+| `flat_ly/` | `SE3-WheelLegged-Flat-LY-GRU`、`*-Stand-GRU`、`*-Turn-GRU`、`*-Arc-GRU` | 从随机初始化 base 开始的静站、转向与弧线平地训练流水线 |
 | `recovery/` | `SE3-WheelLegged-Recovery-GRU` | 倒地自启任务，从平地 GRU checkpoint warm start |
 | `recovery_discovery/` | `SE3-WheelLegged-Recovery-Discovery-GRU` | 倒地自启 discovery 阶段，从 recovery 配置派生 |
 | `recovery_finetune/` | `SE3-WheelLegged-Recovery-FineTune-GRU` | 倒地自启 fine-tune 阶段，使用台阶/恢复状态缓存继续训练 |
@@ -22,11 +22,11 @@
 
 ## flat_ly 学习任务
 
-`flat_ly/` 通过 `flat.env_cfg()` 和 `flat.rl_cfg()` 继承平地基模，再从本任务目录
-依次调用观测、动作、指令、奖励、终止、课程和事件配置接口。奖励入口会清空继承
-的奖励表，具体奖励函数、参数和权重留给学习者设计；奖励为空时只能构造环境和
-检查接口，不能得到有效训练策略。任务使用独立的
-`logs/rsl_rl/se3_wheel_leg_flat_ly/` 实验目录。完整学习顺序和命令见
+`flat_ly/` 保持 34D actor 观测和 6D 动作契约，提供随机初始化 base，以及
+stand、turn、arc 三个只加载 actor/critic 的 warm-start 阶段。静站指令项维护
+位置/yaw 锚点外环，奖励同时约束累计位姿漂移与回零后的低频速度偏置；外环主动
+纠偏期间不施加严格零速惩罚。任务使用独立的
+`logs/rsl_rl/se3_wheel_leg_flat_ly/` 实验目录。完整 fresh 训练顺序和命令见
 [`src/se3_train/tasks/flat_ly/README.md`](../src/se3_train/tasks/flat_ly/README.md)。
 
 ## 台阶任务

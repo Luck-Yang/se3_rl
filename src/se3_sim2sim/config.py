@@ -91,7 +91,8 @@ class YawPidConfig(BaseModel):
     kp: float = 1.0
     ki: float = 0.0
     kd: float = 0.0
-    max_rate: Annotated[float, Field(gt=0.0, le=MAX_YAW_RATE_RAD_S)] = 3.0
+    # flat_ly fresh/base 的 yaw-rate 训练边界为 ±0.3 rad/s；默认评估不能注入 10 倍 OOD 指令。
+    max_rate: Annotated[float, Field(gt=0.0, le=MAX_YAW_RATE_RAD_S)] = 0.3
 
     @model_validator(mode="after")
     def _check_finite(self) -> YawPidConfig:

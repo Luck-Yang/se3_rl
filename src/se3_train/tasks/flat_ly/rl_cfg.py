@@ -17,6 +17,8 @@ def rl_cfg(
     """沿用 flat 的 PPO/GRU 参数，并使用独立实验目录保存训练结果。"""
     cfg = flat_rl_cfg(smoke=smoke)
     cfg.experiment_name = "se3_wheel_leg_flat_ly"
+    # 所有入口默认随机初始化。只有阶段流水线显式传入 resume/load-run/checkpoint 时才 warm-start。
+    cfg.resume = False
     if phase == "stand":
         # 静站属于已有策略的精修，降低更新幅度与熵压力，避免后期重新放大动作抖动。
         cfg.actor.distribution_cfg["init_std"] = 0.20

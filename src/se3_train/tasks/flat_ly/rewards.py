@@ -10,7 +10,7 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor
-from mjlab.utils.lab_api.math import quat_apply_inverse
+from mjlab.utils.lab_api.math import euler_xyz_from_quat, quat_apply_inverse
 
 from se3_shared import wrap_front_action_value_delta_torch
 from se3_train.mdp import recovery_state
@@ -34,6 +34,37 @@ def _standing_mask(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
         return mask.to(device=env.device, dtype=torch.bool)
     command = env.command_manager.get_command(command_name)
     return torch.abs(command[:, 0]) <= 0.02
+
+
+def _command_bool_mask(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    attribute: str,
+    fallback: torch.Tensor,
+) -> torch.Tensor:
+    """读取指令项暴露的布尔掩码，并在旧实现下安全回退。"""
+    term = env.command_manager.get_term(command_name)
+    value = getattr(term, attribute, None)
+    if isinstance(value, torch.Tensor) and value.shape == (env.num_envs,):
+        return value.to(device=env.device, dtype=torch.bool)
+    return fallback
+
+
+def _stationkeeping_correction_mask(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+    """返回静站外环正在主动回零的样本。"""
+    standing = _standing_mask(env, command_name)
+    return _command_bool_mask(
+        env,
+        command_name,
+        "stationkeeping_correction_mask",
+        torch.zeros_like(standing),
+    )
+
+
+def _stationkeeping_settled_mask(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+    """返回已经回到锚点、可以执行严格零速约束的静站样本。"""
+    standing = _standing_mask(env, command_name)
+    return _command_bool_mask(env, command_name, "stationkeeping_settled_mask", standing)
 
 
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -65,8 +96,11 @@ def _orientation_state(
     pitch_ref = torch.atan(accel_ref / _GRAVITY_M_S2)
     pitch_limit = math.radians(float(max_pitch_deg))
     pitch_ref = torch.clamp(pitch_ref, -pitch_limit, pitch_limit)
-    # 静站的物理平衡点必须是 pitch=0，不允许用长期倾斜换取滚动速度。
-    pitch_ref = torch.where(_standing_mask(env, command_name), 0.0, pitch_ref)
+    # 外环主动回零时允许与指令加速度一致的短暂倾角；回零结束后目标恢复为零。
+    strict_standing = _standing_mask(env, command_name) & ~_stationkeeping_correction_mask(
+        env, command_name
+    )
+    pitch_ref = torch.where(strict_standing, 0.0, pitch_ref)
 
     return {
         "pitch": pitch,
@@ -271,7 +305,7 @@ def _standing_stationkeeping_values(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """返回静站的有梯度惩罚、指数分数和样本掩码。"""
     robot = env.scene["robot"]
-    standing = _standing_mask(env, command_name)
+    standing = _stationkeeping_settled_mask(env, command_name)
     orientation = _orientation_state(env, command_name, 0.5, 3.0)
 
     components = torch.stack(
@@ -363,23 +397,54 @@ def _standing_low_frequency_motion_values(
     base_weight: float = 0.25,
     wheel_deadband: float = 0.01,
     wheel_scale: float = 0.05,
-    wheel_weight: float = 1.0,
+    wheel_weight: float = 0.75,
     yaw_deadband: float = 0.01,
     yaw_scale: float = 0.05,
-    yaw_weight: float = 1.0,
-    max_penalty: float = 4.0,
+    yaw_weight: float = 0.75,
+    position_deadband: float = 0.015,
+    position_scale: float = 0.08,
+    position_weight: float = 2.0,
+    lateral_position_weight: float = 1.0,
+    heading_deadband_deg: float = 1.0,
+    heading_scale_deg: float = 5.0,
+    heading_weight: float = 2.0,
+    hold_success_position: float = 0.05,
+    hold_success_heading_deg: float = 3.0,
+    long_hold_s: float = 5.0,
+    max_penalty: float = 8.0,
 ) -> dict[str, torch.Tensor]:
-    """返回静站低频轮面平移、yaw-rate 和机身速度零偏指标。"""
+    """返回静站外环锚点误差与回零后的低频速度零偏指标。"""
     robot = env.scene["robot"]
     standing = _standing_mask(env, command_name)
+    settled = _stationkeeping_settled_mask(env, command_name)
+    correction = _stationkeeping_correction_mask(env, command_name)
+    term = env.command_manager.get_term(command_name)
     wheel_vel = robot.data.joint_vel[:, wheel_joint_ids(robot)]
     wheel_forward = 0.5 * (wheel_vel[:, 0] * 0.059 - wheel_vel[:, 1] * 0.059)
     base_vx = robot.data.root_link_lin_vel_b[:, 0]
     yaw_rate = robot.data.root_link_ang_vel_b[:, 2]
 
+    position_error_w = getattr(term, "stationkeeping_position_error_w", None)
+    if not isinstance(position_error_w, torch.Tensor) or position_error_w.shape != (
+        env.num_envs,
+        2,
+    ):
+        position_error_w = torch.zeros((env.num_envs, 2), device=env.device)
+    heading_error = getattr(term, "stationkeeping_yaw_error", None)
+    if not isinstance(heading_error, torch.Tensor) or heading_error.shape != (env.num_envs,):
+        heading_error = torch.zeros(env.num_envs, device=env.device)
+
+    _, _, heading = euler_xyz_from_quat(robot.data.root_link_quat_w)
+    heading_cos = torch.cos(heading)
+    heading_sin = torch.sin(heading)
+    position_forward = heading_cos * position_error_w[:, 0] + heading_sin * position_error_w[:, 1]
+    position_lateral = -heading_sin * position_error_w[:, 0] + heading_cos * position_error_w[:, 1]
+    position_error = torch.linalg.vector_norm(position_error_w, dim=1)
+
     base_ema = getattr(env, "_flat_ly_stand_base_vx_ema", None)
     wheel_ema = getattr(env, "_flat_ly_stand_wheel_vx_ema", None)
     yaw_ema = getattr(env, "_flat_ly_stand_yaw_rate_ema", None)
+    standing_elapsed = getattr(env, "_flat_ly_standing_elapsed", None)
     if not isinstance(base_ema, torch.Tensor) or base_ema.shape[0] != env.num_envs:
         base_ema = torch.zeros(env.num_envs, device=env.device)
         wheel_ema = torch.zeros(env.num_envs, device=env.device)
@@ -387,22 +452,28 @@ def _standing_low_frequency_motion_values(
         env._flat_ly_stand_base_vx_ema = base_ema
         env._flat_ly_stand_wheel_vx_ema = wheel_ema
         env._flat_ly_stand_yaw_rate_ema = yaw_ema
+    if not isinstance(standing_elapsed, torch.Tensor) or standing_elapsed.shape != (env.num_envs,):
+        standing_elapsed = torch.zeros(env.num_envs, device=env.device)
+        env._flat_ly_standing_elapsed = standing_elapsed
     assert isinstance(wheel_ema, torch.Tensor)
     assert isinstance(yaw_ema, torch.Tensor)
+    assert isinstance(standing_elapsed, torch.Tensor)
 
     current_step = int(getattr(env, "common_step_counter", 0))
     if getattr(env, "_flat_ly_stand_motion_ema_step", -1) != current_step:
         dt = max(float(getattr(env, "step_dt", 0.02)), 1.0e-6)
         alpha = 1.0 - math.exp(-dt / max(float(tau_s), dt))
         reset_mask = env.episode_length_buf <= 1
-        # 非静站阶段不积累历史，下一次静站从零偏重新估计。
-        clear_mask = reset_mask | ~standing
+        # 外环回零期间允许必要运动；只有 settled 后才评估长期速度零偏。
+        clear_mask = reset_mask | ~settled
         base_ema[clear_mask] = 0.0
         wheel_ema[clear_mask] = 0.0
         yaw_ema[clear_mask] = 0.0
-        base_ema.lerp_(torch.where(standing, base_vx, torch.zeros_like(base_vx)), alpha)
-        wheel_ema.lerp_(torch.where(standing, wheel_forward, torch.zeros_like(wheel_forward)), alpha)
-        yaw_ema.lerp_(torch.where(standing, yaw_rate, torch.zeros_like(yaw_rate)), alpha)
+        standing_elapsed[reset_mask | ~standing] = 0.0
+        base_ema.lerp_(torch.where(settled, base_vx, torch.zeros_like(base_vx)), alpha)
+        wheel_ema.lerp_(torch.where(settled, wheel_forward, torch.zeros_like(wheel_forward)), alpha)
+        yaw_ema.lerp_(torch.where(settled, yaw_rate, torch.zeros_like(yaw_rate)), alpha)
+        standing_elapsed.add_(standing.float() * dt)
         env._flat_ly_stand_motion_ema_step = current_step
 
     base_penalty_raw = torch.square(
@@ -417,21 +488,59 @@ def _standing_low_frequency_motion_values(
         torch.clamp(torch.abs(yaw_ema) - float(yaw_deadband), min=0.0)
         / max(float(yaw_scale), 1.0e-6)
     )
-    observable_raw = (
-        float(wheel_weight) * wheel_penalty_raw + float(yaw_weight) * yaw_penalty_raw
+    forward_position_penalty_raw = torch.square(
+        torch.clamp(torch.abs(position_forward) - float(position_deadband), min=0.0)
+        / max(float(position_scale), 1.0e-6)
     )
-    raw_penalty = float(base_weight) * base_penalty_raw + observable_raw
+    lateral_position_penalty_raw = torch.square(
+        torch.clamp(torch.abs(position_lateral) - float(position_deadband), min=0.0)
+        / max(float(position_scale), 1.0e-6)
+    )
+    heading_deadband = math.radians(float(heading_deadband_deg))
+    heading_scale = math.radians(float(heading_scale_deg))
+    heading_penalty_raw = torch.square(
+        torch.clamp(torch.abs(heading_error) - heading_deadband, min=0.0)
+        / max(heading_scale, 1.0e-6)
+    )
+
+    velocity_bias_raw = (
+        float(base_weight) * base_penalty_raw
+        + float(wheel_weight) * wheel_penalty_raw
+        + float(yaw_weight) * yaw_penalty_raw
+    ) * settled.float()
+    pose_drift_raw = (
+        float(position_weight) * forward_position_penalty_raw
+        + float(lateral_position_weight) * lateral_position_penalty_raw
+        + float(heading_weight) * heading_penalty_raw
+    )
+    raw_penalty = velocity_bias_raw + pose_drift_raw
     penalty = _smooth_bounded_square(raw_penalty, max_penalty) * standing.float()
-    score = torch.exp(-observable_raw) * standing.float()
+    score = torch.exp(-raw_penalty) * standing.float()
+    hold_success = (
+        (position_error <= float(hold_success_position))
+        & (torch.abs(heading_error) <= math.radians(float(hold_success_heading_deg)))
+        & standing
+    )
+    long_hold = standing & (standing_elapsed >= float(long_hold_s))
     return {
         "penalty": penalty,
         "score": score,
         "standing": standing,
+        "settled": settled,
+        "correction": correction,
         "base_ema": base_ema,
         "wheel_ema": wheel_ema,
         "yaw_ema": yaw_ema,
+        "position_error": position_error,
+        "position_forward": position_forward,
+        "position_lateral": position_lateral,
+        "heading_error": heading_error,
+        "standing_elapsed": standing_elapsed,
+        "hold_success": hold_success,
+        "long_hold": long_hold,
         "raw_penalty": raw_penalty,
-        "observable_raw": observable_raw,
+        "velocity_bias_raw": velocity_bias_raw,
+        "pose_drift_raw": pose_drift_raw,
     }
 
 
@@ -455,17 +564,47 @@ def standing_low_frequency_motion_penalty(
                 "Locomotion/flat_ly_stand_yaw_rate_ema_abs": _masked_mean(
                     torch.abs(values["yaw_ema"]), standing
                 ).item(),
+                "Locomotion/flat_ly_stand_position_error": _masked_mean(
+                    values["position_error"], standing
+                ).item(),
+                "Locomotion/flat_ly_stand_position_forward_abs": _masked_mean(
+                    torch.abs(values["position_forward"]), standing
+                ).item(),
+                "Locomotion/flat_ly_stand_position_lateral_abs": _masked_mean(
+                    torch.abs(values["position_lateral"]), standing
+                ).item(),
+                "Locomotion/flat_ly_stand_heading_error_abs_deg": torch.rad2deg(
+                    _masked_mean(torch.abs(values["heading_error"]), standing)
+                ).item(),
+                "Locomotion/flat_ly_stand_hold_success_ratio": _masked_mean(
+                    values["hold_success"].float(), standing
+                ).item(),
+                "Locomotion/flat_ly_stand_settled_ratio": values["settled"].float().mean().item(),
+                "Locomotion/flat_ly_stand_correction_ratio": values["correction"]
+                .float()
+                .mean()
+                .item(),
+                "Locomotion/flat_ly_stand_pose_drift_raw": _masked_mean(
+                    values["pose_drift_raw"], standing
+                ).item(),
+                "Locomotion/flat_ly_stand_velocity_bias_raw": _masked_mean(
+                    values["velocity_bias_raw"], standing
+                ).item(),
                 "Locomotion/flat_ly_stand_low_frequency_penalty": _masked_mean(
                     values["penalty"], standing
                 ).item(),
                 "Locomotion/flat_ly_stand_low_frequency_raw_penalty": _masked_mean(
                     values["raw_penalty"], standing
                 ).item(),
-                "Locomotion/flat_ly_stand_observable_motion_raw": _masked_mean(
-                    values["observable_raw"], standing
-                ).item(),
                 "Locomotion/flat_ly_stand_observable_motion_score": _masked_mean(
                     values["score"], standing
+                ).item(),
+                "Locomotion/flat_ly_stand_long_hold_sample_ratio": values["long_hold"]
+                .float()
+                .mean()
+                .item(),
+                "Locomotion/flat_ly_stand_long_hold_success_ratio": _masked_mean(
+                    values["hold_success"].float(), values["long_hold"].bool()
                 ).item(),
             }
         )
@@ -477,7 +616,7 @@ def standing_low_frequency_motion_reward(
     command_name: str,
     **params: float,
 ) -> torch.Tensor:
-    """奖励静站轮面平移和 yaw-rate 的长期均值接近零。"""
+    """奖励静站入口位姿保持且轮面平移、yaw-rate 的长期均值接近零。"""
     values = _standing_low_frequency_motion_values(env, command_name, **params)
     return values["score"]
 
@@ -812,6 +951,9 @@ def physical_stability_reward(
 
     # 课程使用分桶最弱项，避免运动样本掩盖静站或扰动恢复失败。
     standing_mask = _standing_mask(env, command_name)
+    settled_mask = _stationkeeping_settled_mask(env, command_name)
+    correction_mask = _stationkeeping_correction_mask(env, command_name)
+    moving_mask = ~standing_mask
     recovery_mask = recovery_state.recovery_episode_mask(env)
 
     zero_speed_penalty = _scaled_deadband_square(
@@ -824,21 +966,7 @@ def physical_stability_reward(
     _, standing_stationkeeping_score, _ = _standing_stationkeeping_values(env, command_name)
     standing_motion_score = torch.ones_like(standing_stationkeeping_score)
     if "standing_low_frequency_motion_reward" in env.reward_manager.active_terms:
-        motion_values = _standing_low_frequency_motion_values(
-            env,
-            command_name,
-            tau_s=0.75,
-            base_deadband=0.01,
-            base_scale=0.05,
-            base_weight=0.25,
-            wheel_deadband=0.01,
-            wheel_scale=0.05,
-            wheel_weight=1.0,
-            yaw_deadband=0.01,
-            yaw_scale=0.05,
-            yaw_weight=1.0,
-            max_penalty=4.0,
-        )
+        motion_values = _standing_low_frequency_motion_values(env, command_name)
         standing_motion_score = torch.where(
             standing_mask,
             motion_values["score"],
@@ -879,14 +1007,15 @@ def physical_stability_reward(
     recovery_course_mean = (
         recovery_per_env[recovery_mask].mean() if recovery_mask.any() else base_course_mean
     )
-    yaw_command_mask = torch.abs(command[:, 1]) > 0.03
+    # 静站外环也会写入 yaw-rate 指令，但不能污染 turn/arc 的运动课程统计。
+    yaw_command_mask = moving_mask & (torch.abs(command[:, 1]) > 0.03)
     yaw_course_mean = (
         per_env_course_score[yaw_command_mask].mean()
         if yaw_command_mask.any()
         else torch.zeros((), device=env.device)
     )
-    yaw_positive_mask = command[:, 1] > 0.03
-    yaw_negative_mask = command[:, 1] < -0.03
+    yaw_positive_mask = moving_mask & (command[:, 1] > 0.03)
+    yaw_negative_mask = moving_mask & (command[:, 1] < -0.03)
     yaw_positive_mean = (
         per_env_course_score[yaw_positive_mask].mean()
         if yaw_positive_mask.any()
@@ -916,18 +1045,24 @@ def physical_stability_reward(
                 "Locomotion/flat_ly_course_yaw_positive_score": yaw_positive_mean.item(),
                 "Locomotion/flat_ly_course_yaw_negative_score": yaw_negative_mean.item(),
                 "Locomotion/flat_ly_standing_sample_ratio": standing_mask.float().mean().item(),
+                "Locomotion/flat_ly_stationkeeping_settled_ratio": settled_mask.float()
+                .mean()
+                .item(),
+                "Locomotion/flat_ly_stationkeeping_correction_ratio": correction_mask.float()
+                .mean()
+                .item(),
                 "Locomotion/flat_ly_recovery_sample_ratio": recovery_mask.float().mean().item(),
                 "Locomotion/flat_ly_yaw_command_sample_ratio": yaw_command_mask.float()
                 .mean()
                 .item(),
                 "Locomotion/flat_ly_straight_command_sample_ratio": (
-                    (torch.abs(command[:, 0]) > 0.03) & ~yaw_command_mask
+                    moving_mask & (torch.abs(command[:, 0]) > 0.03) & ~yaw_command_mask
                 )
                 .float()
                 .mean()
                 .item(),
                 "Locomotion/flat_ly_yaw_only_command_sample_ratio": (
-                    (torch.abs(command[:, 0]) <= 0.03) & yaw_command_mask
+                    moving_mask & (torch.abs(command[:, 0]) <= 0.03) & yaw_command_mask
                 )
                 .float()
                 .mean()
@@ -1228,31 +1363,43 @@ def configure_rewards(
         }
     )
 
-    if phase in {"stand", "turn", "arc"}:
-        motion_params = {
-            "command_name": "velocity_height",
-            "tau_s": 0.75,
-            "base_deadband": 0.01,
-            "base_scale": 0.05,
-            "base_weight": 0.25,
-            "wheel_deadband": 0.01,
-            "wheel_scale": 0.05,
-            "wheel_weight": 1.0,
-            "yaw_deadband": 0.01,
-            "yaw_scale": 0.05,
-            "yaw_weight": 1.0,
-            "max_penalty": 4.0,
-        }
-        cfg.rewards["standing_low_frequency_motion_penalty"] = RewardTermCfg(
-            func=standing_low_frequency_motion_penalty,
-            weight=-5.0 if phase == "stand" else -2.0,
-            params=motion_params.copy(),
-        )
-        cfg.rewards["standing_low_frequency_motion_reward"] = RewardTermCfg(
-            func=standing_low_frequency_motion_reward,
-            weight=4.0 if phase == "stand" else 1.5,
-            params=motion_params.copy(),
-        )
+    # 从 model0 训练时 base 阶段也必须看见长期漂移，否则后续阶段只能修补既有坏习惯。
+    motion_params = {
+        "command_name": "velocity_height",
+        "tau_s": 0.75,
+        "base_deadband": 0.01,
+        "base_scale": 0.05,
+        "base_weight": 0.25,
+        "wheel_deadband": 0.01,
+        "wheel_scale": 0.05,
+        "wheel_weight": 0.75,
+        "yaw_deadband": 0.01,
+        "yaw_scale": 0.05,
+        "yaw_weight": 0.75,
+        "position_deadband": 0.015,
+        "position_scale": 0.08,
+        "position_weight": 2.0,
+        "lateral_position_weight": 1.0,
+        "heading_deadband_deg": 1.0,
+        "heading_scale_deg": 5.0,
+        "heading_weight": 2.0,
+        "hold_success_position": 0.05,
+        "hold_success_heading_deg": 3.0,
+        "long_hold_s": 5.0,
+        "max_penalty": 8.0,
+    }
+    penalty_weight = {"base": -3.0, "stand": -5.0, "turn": -2.0, "arc": -2.0}[phase]
+    reward_weight = {"base": 2.5, "stand": 4.0, "turn": 1.5, "arc": 1.5}[phase]
+    cfg.rewards["standing_low_frequency_motion_penalty"] = RewardTermCfg(
+        func=standing_low_frequency_motion_penalty,
+        weight=penalty_weight,
+        params=motion_params.copy(),
+    )
+    cfg.rewards["standing_low_frequency_motion_reward"] = RewardTermCfg(
+        func=standing_low_frequency_motion_reward,
+        weight=reward_weight,
+        params=motion_params.copy(),
+    )
 
     if phase == "stand":
         cfg.rewards["standing_stationkeeping_penalty"].weight = -3.0
