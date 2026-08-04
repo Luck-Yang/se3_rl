@@ -11,7 +11,7 @@ def configure_events(
     cfg: ManagerBasedRlEnvCfg,
     *,
     play: bool,
-    phase: Literal["base", "stand", "turn", "arc"] = "base",
+    phase: Literal["base", "speed", "stand", "turn", "arc"] = "base",
 ) -> None:
     """从对称名义姿态起步，再逐步扩大初始关节扰动。"""
     if play:
@@ -52,7 +52,7 @@ def configure_events(
                 ],
             }
         )
-        if phase in {"stand", "turn", "arc"}:
+        if phase in {"speed", "stand", "turn", "arc"}:
             reset_root_cfg.params["recovery_prob"] = 0.15 if phase != "turn" else 0.10
             reset_root_cfg.params["recovery_stages"] = [
                 {
@@ -94,7 +94,7 @@ def configure_events(
                 ],
             }
         )
-        if phase in {"stand", "turn", "arc"}:
+        if phase in {"speed", "stand", "turn", "arc"}:
             reset_joints_cfg.params["curriculum_stages"] = [
                 {
                     "iteration": 0,

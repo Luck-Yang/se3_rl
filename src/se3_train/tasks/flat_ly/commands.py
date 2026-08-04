@@ -424,7 +424,7 @@ def configure_commands(
     cfg: ManagerBasedRlEnvCfg,
     *,
     play: bool,
-    phase: Literal["base", "stand", "turn", "arc"] = "base",
+    phase: Literal["base", "speed", "stand", "turn", "arc"] = "base",
 ) -> None:
     """固定稳态水平目标，训练时对速度指令施加加速度限幅。"""
     source_cfg = cfg.commands["velocity_height"]
@@ -448,7 +448,17 @@ def configure_commands(
     command_cfg.yaw_deadband = 0.03
     command_cfg.lin_vel_slew_rate = None if play else 0.8
 
-    if phase == "stand":
+    if phase == "speed":
+        # 中高速阶段保留 20% 静站样本防止遗忘，其余样本以双向直行为主。
+        command_cfg.standing_ratio = 0.20
+        command_cfg.straight_motion_ratio = 0.85
+        command_cfg.yaw_only_ratio = 0.0
+        # 训练从第一档开始；回放时直接开放完整范围，便于验证最终 checkpoint。
+        command_cfg.lin_vel_x_range = (-2.0, 2.0) if play else (-0.2, 0.2)
+        command_cfg.ang_vel_yaw_range = (-0.3, 0.3)
+        command_cfg.yaw_vel_slew_rate = None if play else 2.0
+        command_cfg.resampling_time_range = (8.0, 8.0)
+    elif phase == "stand":
         command_cfg.standing_ratio = 0.80
         command_cfg.straight_motion_ratio = 0.75
         command_cfg.yaw_only_ratio = 0.25

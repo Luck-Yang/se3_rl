@@ -13,7 +13,7 @@ from . import actions, commands, curriculums, events, observations, rewards, ter
 
 def env_cfg(
     play: bool = False,
-    phase: Literal["base", "stand", "turn", "arc"] = "base",
+    phase: Literal["base", "speed", "stand", "turn", "arc"] = "base",
 ) -> ManagerBasedRlEnvCfg:
     """组装 flat_ly 环境，并把各类 MDP 配置交给本目录的学习接口。"""
     cfg = flat_env_cfg(play=play)

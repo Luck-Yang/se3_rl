@@ -12,7 +12,7 @@ from se3_train.tasks.flat.rl_cfg import rl_cfg as flat_rl_cfg
 
 def rl_cfg(
     smoke: bool = False,
-    phase: Literal["base", "stand", "turn", "arc"] = "base",
+    phase: Literal["base", "speed", "stand", "turn", "arc"] = "base",
 ) -> RslRlOnPolicyRunnerCfg:
     """沿用 flat 的 PPO/GRU 参数，并使用独立实验目录保存训练结果。"""
     cfg = flat_rl_cfg(smoke=smoke)
@@ -30,6 +30,13 @@ def rl_cfg(
         cfg.algorithm.class_name = "se3_train.tasks.flat_ly.ppo:FlatLyBasePPO"
     # 所有入口默认随机初始化。只有阶段流水线显式传入 resume/load-run/checkpoint 时才 warm-start。
     cfg.resume = False
+    if phase == "speed":
+        # 已有低速策略只需要适度恢复探索；过大的 std 会立即破坏姿态和扭矩控制。
+        cfg.algorithm.class_name = "se3_train.tasks.flat_ly.ppo:FlatLySpeedPPO"
+        cfg.actor.distribution_cfg["init_std"] = 0.15
+        cfg.algorithm.learning_rate = 8.0e-5
+        cfg.algorithm.entropy_coef = 2.0e-3
+        cfg.algorithm.desired_kl = 0.006
     if phase == "stand":
         # 静站属于已有策略的精修，降低更新幅度与熵压力，避免后期重新放大动作抖动。
         cfg.algorithm.class_name = "se3_train.tasks.flat_ly.ppo:FlatLyFineTunePPO"

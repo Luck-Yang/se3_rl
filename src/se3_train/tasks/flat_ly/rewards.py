@@ -1034,6 +1034,19 @@ def physical_stability_reward(
         if yaw_negative_mask.any()
         else torch.zeros((), device=env.device)
     )
+    # 中高速课程必须让前进和后退分别达标，不能由样本更多或更容易的一侧掩盖另一侧。
+    linear_positive_mask = moving_mask & (command[:, 0] > 0.03)
+    linear_negative_mask = moving_mask & (command[:, 0] < -0.03)
+    linear_positive_mean = (
+        per_env_course_score[linear_positive_mask].mean()
+        if linear_positive_mask.any()
+        else torch.zeros((), device=env.device)
+    )
+    linear_negative_mean = (
+        per_env_course_score[linear_negative_mask].mean()
+        if linear_negative_mask.any()
+        else torch.zeros((), device=env.device)
+    )
     course_score = torch.stack((base_course_mean, standing_course_mean, recovery_course_mean)).min()
 
     if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
@@ -1052,6 +1065,8 @@ def physical_stability_reward(
                 "Locomotion/flat_ly_course_yaw_tracking_score": yaw_course_mean.item(),
                 "Locomotion/flat_ly_course_yaw_positive_score": yaw_positive_mean.item(),
                 "Locomotion/flat_ly_course_yaw_negative_score": yaw_negative_mean.item(),
+                "Locomotion/flat_ly_course_linear_positive_score": linear_positive_mean.item(),
+                "Locomotion/flat_ly_course_linear_negative_score": linear_negative_mean.item(),
                 "Locomotion/flat_ly_standing_sample_ratio": standing_mask.float().mean().item(),
                 "Locomotion/flat_ly_stationkeeping_settled_ratio": settled_mask.float()
                 .mean()
@@ -1165,7 +1180,7 @@ def velocity_tracking_reward(
 def configure_rewards(
     cfg: ManagerBasedRlEnvCfg,
     *,
-    phase: Literal["base", "stand", "turn", "arc"] = "base",
+    phase: Literal["base", "speed", "stand", "turn", "arc"] = "base",
 ) -> None:
     """按训练阶段配置静站、原地转向和弧线转弯奖励。"""
     cfg.rewards.clear()
@@ -1394,8 +1409,20 @@ def configure_rewards(
         "long_hold_s": 5.0,
         "max_penalty": 8.0,
     }
-    penalty_weight = {"base": -3.0, "stand": -5.0, "turn": -2.0, "arc": -2.0}[phase]
-    reward_weight = {"base": 2.5, "stand": 4.0, "turn": 1.5, "arc": 1.5}[phase]
+    penalty_weight = {
+        "base": -3.0,
+        "speed": -2.0,
+        "stand": -5.0,
+        "turn": -2.0,
+        "arc": -2.0,
+    }[phase]
+    reward_weight = {
+        "base": 2.5,
+        "speed": 1.5,
+        "stand": 4.0,
+        "turn": 1.5,
+        "arc": 1.5,
+    }[phase]
     cfg.rewards["standing_low_frequency_motion_penalty"] = RewardTermCfg(
         func=standing_low_frequency_motion_penalty,
         weight=penalty_weight,

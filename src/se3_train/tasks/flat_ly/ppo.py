@@ -109,4 +109,15 @@ class FlatLyFineTunePPO(FlatLyBoundedPPO):
     max_learning_rate = 5.0e-5
 
 
-__all__ = ["FlatLyBasePPO", "FlatLyBoundedPPO", "FlatLyFineTunePPO"]
+class FlatLySpeedPPO(FlatLyBoundedPPO):
+    """限制中高速 warm-start 的更新幅度，保护已有低速稳定策略。"""
+
+    max_learning_rate = 1.0e-4
+
+
+__all__ = [
+    "FlatLyBasePPO",
+    "FlatLyBoundedPPO",
+    "FlatLyFineTunePPO",
+    "FlatLySpeedPPO",
+]

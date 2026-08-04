@@ -14,6 +14,7 @@ from .env_cfg import env_cfg
 from .rl_cfg import rl_cfg
 
 TASK_ID = "SE3-WheelLegged-Flat-LY-GRU"
+SPEED_TASK_ID = "SE3-WheelLegged-Flat-LY-Speed-GRU"
 STAND_TASK_ID = "SE3-WheelLegged-Flat-LY-Stand-GRU"
 TURN_TASK_ID = "SE3-WheelLegged-Flat-LY-Turn-GRU"
 ARC_TASK_ID = "SE3-WheelLegged-Flat-LY-Arc-GRU"
@@ -77,7 +78,7 @@ class FlatLyWarmStartRunner(Se3WarmStartRunner):
 
 
 def register() -> None:
-    """注册基线、静站精修、原地转向和行进转弯任务。"""
+    """注册基线、中高速、静站精修、原地转向和行进转弯任务。"""
     register_mjlab_task(
         task_id=TASK_ID,
         env_cfg=env_cfg(),
@@ -86,6 +87,7 @@ def register() -> None:
         runner_cls=Se3ProfiledOnPolicyRunner,
     )
     for task_id, phase in (
+        (SPEED_TASK_ID, "speed"),
         (STAND_TASK_ID, "stand"),
         (TURN_TASK_ID, "turn"),
         (ARC_TASK_ID, "arc"),
@@ -101,6 +103,7 @@ def register() -> None:
 
 __all__ = [
     "ARC_TASK_ID",
+    "SPEED_TASK_ID",
     "STAND_TASK_ID",
     "TASK_ID",
     "TURN_TASK_ID",

@@ -1,15 +1,39 @@
 # flat_ly 平地 GRU 任务
 
-`flat_ly` 是独立的 34D actor 观测、6D 动作平地任务。当前提供一个统一 base 和三个后续阶段：
+`flat_ly` 是独立的 34D actor 观测、6D 动作平地任务。当前提供一个统一 base 和四个后续阶段：
 
 | 阶段 | task id | 初始化语义 |
 | --- | --- | --- |
 | base | `SE3-WheelLegged-Flat-LY-GRU` | 随机初始化，默认 `resume=False` |
+| speed | `SE3-WheelLegged-Flat-LY-Speed-GRU` | 从低速 base 权重 warm-start，双向逐档扩到 ±2.0 m/s |
 | stand | `SE3-WheelLegged-Flat-LY-Stand-GRU` | 从本次 base 权重 warm-start |
 | turn | `SE3-WheelLegged-Flat-LY-Turn-GRU` | 从本次 stand 权重 warm-start |
 | arc | `SE3-WheelLegged-Flat-LY-Arc-GRU` | 从本次 turn 权重 warm-start |
 
 这里的 warm-start 只加载 actor/critic 权重。optimizer、迭代号和环境计数从 0 开始，且新阶段配置的 `init_std`、学习率会重新应用。它不是继续旧 run 的完整 resume。
+
+## 从低速 base 训练双向中高速
+
+中高速阶段按以下速度上限逐档训练，每一档都同时采样正向和反向：
+
+```text
+±0.2 -> ±0.4 -> ±0.6 -> ±0.8 -> ±1.0
+-> ±1.2 -> ±1.4 -> ±1.6 -> ±1.8 -> ±2.0 m/s
+```
+
+正向、反向的运动物理分数必须分别达标，并且严格静站分数不能低于防遗忘护栏，课程才会晋级。默认每档至少停留 250 轮。用已有低速 checkpoint 启动：
+
+```bash
+bash scripts/train_flat_ly_speed.sh logs/rsl_rl/se3_wheel_leg_flat_ly/<低速_run>/model_999.pt
+```
+
+脚本默认使用 4096 个环境和 3700 轮。按 7.7 秒一轮估算，纯迭代时间约 7.91 小时。可用环境变量覆盖：
+
+```bash
+SE3_FLAT_LY_SPEED_NUM_ENVS=4096 \
+SE3_FLAT_LY_SPEED_ITERATIONS=3700 \
+bash scripts/train_flat_ly_speed.sh logs/rsl_rl/se3_wheel_leg_flat_ly/<低速_run>/model_999.pt
+```
 
 ## 直接从零训练统一 base
 

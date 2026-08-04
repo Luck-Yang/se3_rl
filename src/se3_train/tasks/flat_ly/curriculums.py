@@ -20,6 +20,13 @@ _YAW_MAX_ATTR = "_flat_ly_physical_yaw_max"
 _YAW_EMA_ATTR = "_flat_ly_physical_yaw_ema"
 _YAW_STAGE_START_STEP_ATTR = "_flat_ly_physical_yaw_stage_start_step"
 _YAW_STAGE_INDEX_ATTR = "_flat_ly_yaw_stage_index"
+_SPEED_STAGE_INDEX_ATTR = "_flat_ly_speed_stage_index"
+_SPEED_EMA_ATTR = "_flat_ly_speed_course_ema"
+_SPEED_STANDING_EMA_ATTR = "_flat_ly_speed_standing_ema"
+_SPEED_STAGE_START_STEP_ATTR = "_flat_ly_speed_stage_start_step"
+_SPEED_POSITIVE_SCORE_ATTR = "_flat_ly_speed_positive_score"
+_SPEED_NEGATIVE_SCORE_ATTR = "_flat_ly_speed_negative_score"
+_SPEED_STANDING_SCORE_ATTR = "_flat_ly_speed_standing_score"
 
 
 def commands_vel_physical(
@@ -201,11 +208,110 @@ def commands_yaw_staged(
     }
 
 
+def commands_speed_staged(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    lin_stages: tuple[float, ...],
+    advance_threshold: float = 0.55,
+    standing_guard_threshold: float = 0.25,
+    ema_alpha: float = 0.05,
+    min_stage_iterations: int = 250,
+    steps_per_policy_iter: int = 64,
+) -> dict[str, torch.Tensor]:
+    """正向、反向和静站护栏分别达标后，扩大双向线速度范围。"""
+    del env_ids
+    term = env.command_manager.get_term(command_name)
+    cfg: VelocityHeightCommandCfg = term.cfg  # type: ignore[assignment]
+    stages = tuple(sorted({abs(float(value)) for value in lin_stages if float(value) > 0.0}))
+    if not stages:
+        raise ValueError("lin_stages 必须包含至少一个正数档位")
+
+    common_step = int(getattr(env, "common_step_counter", 0))
+    if not hasattr(env, _SPEED_STAGE_INDEX_ATTR):
+        setattr(env, _SPEED_STAGE_INDEX_ATTR, 0)
+        setattr(env, _SPEED_EMA_ATTR, 0.0)
+        setattr(env, _SPEED_STANDING_EMA_ATTR, 0.0)
+        setattr(env, _SPEED_STAGE_START_STEP_ATTR, common_step)
+        setattr(env, _SPEED_POSITIVE_SCORE_ATTR, float("nan"))
+        setattr(env, _SPEED_NEGATIVE_SCORE_ATTR, float("nan"))
+        setattr(env, _SPEED_STANDING_SCORE_ATTR, float("nan"))
+
+    stage_index = min(int(getattr(env, _SPEED_STAGE_INDEX_ATTR)), len(stages) - 1)
+    speed_ema = float(getattr(env, _SPEED_EMA_ATTR))
+    standing_ema = float(getattr(env, _SPEED_STANDING_EMA_ATTR))
+    stage_start_step = int(getattr(env, _SPEED_STAGE_START_STEP_ATTR))
+    min_stage_steps = max(0, int(min_stage_iterations)) * max(1, int(steps_per_policy_iter))
+    dwell_progress = min(
+        max((common_step - stage_start_step) / max(float(min_stage_steps), 1.0), 0.0),
+        1.0,
+    )
+
+    log = getattr(env, "extras", {}).get("log", {})
+    positive_score = log.get("Locomotion/flat_ly_course_linear_positive_score")
+    negative_score = log.get("Locomotion/flat_ly_course_linear_negative_score")
+    standing_score = log.get("Locomotion/flat_ly_course_standing_score")
+    if positive_score is not None and negative_score is not None and standing_score is not None:
+        positive_score = float(positive_score)
+        negative_score = float(negative_score)
+        standing_score = float(standing_score)
+        setattr(env, _SPEED_POSITIVE_SCORE_ATTR, positive_score)
+        setattr(env, _SPEED_NEGATIVE_SCORE_ATTR, negative_score)
+        setattr(env, _SPEED_STANDING_SCORE_ATTR, standing_score)
+        physical_score = min(positive_score, negative_score)
+        alpha = min(max(float(ema_alpha), 0.0), 1.0)
+        speed_ema = (1.0 - alpha) * speed_ema + alpha * physical_score
+        standing_ema = (1.0 - alpha) * standing_ema + alpha * standing_score
+        if (
+            speed_ema > float(advance_threshold)
+            and standing_ema > float(standing_guard_threshold)
+            and dwell_progress >= 1.0
+            and stage_index < len(stages) - 1
+        ):
+            stage_index += 1
+            speed_ema = 0.0
+            standing_ema = 0.0
+            stage_start_step = common_step
+            dwell_progress = 0.0
+        setattr(env, _SPEED_STAGE_INDEX_ATTR, stage_index)
+        setattr(env, _SPEED_EMA_ATTR, speed_ema)
+        setattr(env, _SPEED_STANDING_EMA_ATTR, standing_ema)
+        setattr(env, _SPEED_STAGE_START_STEP_ATTR, stage_start_step)
+    else:
+        positive_score = float(getattr(env, _SPEED_POSITIVE_SCORE_ATTR))
+        negative_score = float(getattr(env, _SPEED_NEGATIVE_SCORE_ATTR))
+        standing_score = float(getattr(env, _SPEED_STANDING_SCORE_ATTR))
+        physical_score = min(positive_score, negative_score)
+
+    lin_x_max = stages[stage_index]
+    cfg.lin_vel_x_range = (-lin_x_max, lin_x_max)
+    return {
+        "lin_vel_x_max": torch.tensor(lin_x_max, device=env.device),
+        "linear_stage_index": torch.tensor(float(stage_index), device=env.device),
+        "speed_ema": torch.tensor(speed_ema, device=env.device),
+        "standing_guard_ema": torch.tensor(standing_ema, device=env.device),
+        "stage_dwell_progress": torch.tensor(dwell_progress, device=env.device),
+        "physical_score": torch.tensor(physical_score, device=env.device),
+        "linear_positive_score": torch.tensor(
+            positive_score,
+            device=env.device,
+        ),
+        "linear_negative_score": torch.tensor(
+            negative_score,
+            device=env.device,
+        ),
+        "standing_guard_score": torch.tensor(
+            standing_score,
+            device=env.device,
+        ),
+    }
+
+
 def configure_curriculums(
     cfg: ManagerBasedRlEnvCfg,
     *,
     play: bool,
-    phase: Literal["base", "stand", "turn", "arc"] = "base",
+    phase: Literal["base", "speed", "stand", "turn", "arc"] = "base",
 ) -> None:
     """使用综合物理稳定分数扩展直线速度课程。"""
     if play:
@@ -214,6 +320,20 @@ def configure_curriculums(
     command_vel_cfg = cfg.curriculum.get("command_vel")
     if phase == "stand":
         cfg.curriculum.pop("command_vel", None)
+    elif phase == "speed" and command_vel_cfg is not None:
+        command_vel_cfg.func = commands_speed_staged
+        command_vel_cfg.params.clear()
+        command_vel_cfg.params.update(
+            {
+                "command_name": "velocity_height",
+                "lin_stages": (0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0),
+                "advance_threshold": 0.55,
+                "standing_guard_threshold": 0.25,
+                "ema_alpha": 0.05,
+                "min_stage_iterations": 250,
+                "steps_per_policy_iter": 64,
+            }
+        )
     elif phase in {"turn", "arc"} and command_vel_cfg is not None:
         command_vel_cfg.func = commands_yaw_staged
         command_vel_cfg.params.clear()
@@ -250,7 +370,24 @@ def configure_curriculums(
 
     push_cfg = cfg.curriculum.get("push_disturbance")
     if push_cfg is not None:
-        if phase == "stand":
+        if phase == "speed":
+            push_cfg.params.update(
+                {
+                    "use_iterations": True,
+                    "fixed_iteration": 0,
+                    "push_stages": [
+                        {
+                            "iteration": 0,
+                            "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0)},
+                        },
+                        {
+                            "iteration": 2800,
+                            "velocity_range": {"x": (-0.10, 0.10), "y": (-0.10, 0.10)},
+                        },
+                    ],
+                }
+            )
+        elif phase == "stand":
             push_cfg.params.update(
                 {
                     "use_iterations": True,
