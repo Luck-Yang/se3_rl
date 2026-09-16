@@ -7,7 +7,7 @@
 | base | `SE3-WheelLegged-Flat-LY-GRU` | 随机初始化，默认 `resume=False` |
 | speed | `SE3-WheelLegged-Flat-LY-Speed-GRU` | 从低速 base 权重 warm-start，双向逐档扩到 ±2.0 m/s |
 | stand | `SE3-WheelLegged-Flat-LY-Stand-GRU` | 从本次 base 权重 warm-start |
-| turn | `SE3-WheelLegged-Flat-LY-Turn-GRU` | 从本次 stand 权重 warm-start |
+| turn | `SE3-WheelLegged-Flat-LY-Turn-GRU` | 推荐从完成的 speed 权重 warm-start，双向逐档学习原地 yaw |
 | arc | `SE3-WheelLegged-Flat-LY-Arc-GRU` | 从本次 turn 权重 warm-start |
 
 这里的 warm-start 只加载 actor/critic 权重。optimizer、迭代号和环境计数从 0 开始，且新阶段配置的 `init_std`、学习率会重新应用。它不是继续旧 run 的完整 resume。
@@ -35,6 +35,64 @@ SE3_FLAT_LY_SPEED_ITERATIONS=3700 \
 bash scripts/train_flat_ly_speed.sh logs/rsl_rl/se3_wheel_leg_flat_ly/<低速_run>/model_999.pt
 ```
 
+## 从中高速模型继续训练 yaw 转向
+
+完成 speed 阶段后，用它的最终 checkpoint 启动独立 turn 阶段：
+
+```bash
+bash scripts/train_flat_ly_yaw.sh \
+  logs/rsl_rl/se3_wheel_leg_flat_ly/<speed_run>/model_3699.pt
+```
+
+默认课程如下：
+
+```text
+±0.3 -> ±0.5 -> ±0.8 -> ±1.2 -> ±1.8
+-> ±2.5 -> ±3.5 -> ±4.5 -> ±6.0 rad/s
+```
+
+turn 阶段先分离能力：25% 静站、约 56% 原地 yaw、约 19% `±0.3 m/s` 双向低速直行，不在第一档混入 `±2 m/s` 与 yaw 的组合命令。课程只有在以下四个条件同时满足时才晋级：
+
+- 当前 yaw 上限附近的正向和负向分桶都达到阈值；
+- 静站稳定分数不低于防遗忘护栏；
+- 正向和反向低速直行的最弱分数不低于防遗忘护栏；
+- 当前档位至少训练 200 轮。
+
+`6 rad/s` 原地转向时，每侧理论轮速约为 `22 rad/s`；相对 `45 rad/s` 的轮速上限仍保留约一半余量给倒立平衡。默认使用 4096 个环境和 3000 轮，可覆盖：
+
+```bash
+SE3_FLAT_LY_YAW_NUM_ENVS=4096 \
+SE3_FLAT_LY_YAW_ITERATIONS=3000 \
+bash scripts/train_flat_ly_yaw.sh \
+  logs/rsl_rl/se3_wheel_leg_flat_ly/<speed_run>/model_3699.pt
+```
+
+重点观察 TensorBoard 指标：
+
+- `Curriculum/command_vel/yaw_*`：当前档位、正负边界分数、静站与直行护栏；
+- `Locomotion/flat_ly_turn_stable_yaw_reward`：姿态稳定门控后的 yaw 跟踪奖励；
+- `Locomotion/flat_ly_turn_translation_speed_positive` 与 `*negative`：正负原地转向时的非期望平移；
+- `Locomotion/flat_ly_course_yaw_boundary_positive_score` 与 `*negative_score`：当前边界的方向不对称。
+
+训练任务的自动采样回放会直接开放终档 `±6 rad/s`，并继续受差速轮轮速包络裁剪：
+
+```bash
+uv run se3-play SE3-WheelLegged-Flat-LY-Turn-GRU \
+  --checkpoint-file logs/rsl_rl/se3_wheel_leg_flat_ly/<yaw_run>/model_<iter>.pt \
+  --viewer viser --num-envs 1
+```
+
+`se3-play` 会按 turn 配置自动切换静站、低速直行和正负 yaw；它不是固定工况。需要对同一个 yaw 指令做正负 A/B 时，使用 sim2sim 的固定 `--command`，并关闭额外 yaw PID，避免 PID 替策略补偿：
+
+```bash
+uv run se3-sim2sim \
+  --checkpoint logs/rsl_rl/se3_wheel_leg_flat_ly/<yaw_run>/model_<iter>.pt \
+  --viewer rerun --max-steps 3000 --course none --no-yaw-pid \
+  --command 0.0 1.0 0.0 0.0 0.22 0.0 0.2 0.0
+```
+
+把第二个数字 `1.0` 改为 `-1.0` 即可对照负 yaw。`arc` 的 `se3-play` 同样开放 `±6 rad/s`，但组合命令会按剩余轮速预算自动裁剪。
+
 ## 直接从零训练统一 base
 
 下面的命令不会查找或加载旧 checkpoint：
@@ -55,7 +113,7 @@ uv run se3-train SE3-WheelLegged-Flat-LY-GRU \
 bash scripts/train_flat_ly_three_stage.sh
 ```
 
-脚本先训练新的随机初始化 base，再依次运行 stand、turn 和 arc。它不再搜索旧 V8，也不会自动选择历史目录。每次执行会生成唯一 `pipeline_id`，后续阶段只读取本次流水线刚生成且唯一匹配的 checkpoint；若 run-name 已存在、输出不唯一或 checkpoint 缺失，脚本会立即失败。
+这个旧流水线先训练新的随机初始化 base，再依次运行 stand、turn 和 arc；它没有插入新建的 speed 阶段。当前已有中高速 checkpoint 时，优先使用上面的 `train_flat_ly_yaw.sh`，避免从 stand 直接进入 yaw。流水线不搜索旧 V8，也不会自动选择历史目录。每次执行会生成唯一 `pipeline_id`，后续阶段只读取本次流水线刚生成且唯一匹配的 checkpoint；若 run-name 已存在、输出不唯一或 checkpoint 缺失，脚本会立即失败。
 
 可通过环境变量调整规模：
 

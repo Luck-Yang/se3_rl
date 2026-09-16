@@ -253,6 +253,51 @@ def yaw_rate_precision_reward(
     return torch.exp(-torch.square(error / torch.clamp(scale, min=1.0e-6)))
 
 
+def stable_yaw_rate_tracking_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    base_scale: float = 0.2,
+    relative_scale: float = 0.08,
+    pitch_scale_deg: float = 6.0,
+    roll_scale_deg: float = 6.0,
+    ang_vel_xy_scale: float = 0.8,
+    min_command: float = 0.05,
+) -> torch.Tensor:
+    """仅对有效 yaw 指令且机身姿态稳定的样本兑现跟踪奖励。"""
+    robot = env.scene["robot"]
+    command = env.command_manager.get_command(command_name)[:, 1]
+    yaw_error = robot.data.root_link_ang_vel_b[:, 2] - command
+    yaw_scale = float(base_scale) + float(relative_scale) * torch.abs(command)
+    yaw_score = torch.exp(-torch.square(yaw_error / torch.clamp(yaw_scale, min=1.0e-6)))
+
+    orientation = _orientation_state(env, command_name, 0.5, 3.0)
+    pitch_scale = max(math.radians(float(pitch_scale_deg)), 1.0e-6)
+    roll_scale = max(math.radians(float(roll_scale_deg)), 1.0e-6)
+    ang_vel_xy = torch.linalg.vector_norm(robot.data.root_link_ang_vel_b[:, :2], dim=1)
+    stability_score = torch.exp(
+        -torch.square((orientation["pitch"] - orientation["pitch_ref"]) / pitch_scale)
+        - torch.square(orientation["roll"] / roll_scale)
+        - torch.square(ang_vel_xy / max(float(ang_vel_xy_scale), 1.0e-6))
+    )
+    active = torch.abs(command) >= float(min_command)
+    reward = yaw_score * stability_score * active.float()
+
+    if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
+        env.extras.setdefault("log", {}).update(
+            {
+                "Locomotion/flat_ly_turn_active_yaw_ratio": active.float().mean().item(),
+                "Locomotion/flat_ly_turn_yaw_precision_score": _masked_mean(
+                    yaw_score, active
+                ).item(),
+                "Locomotion/flat_ly_turn_stability_gate": _masked_mean(
+                    stability_score, active
+                ).item(),
+                "Locomotion/flat_ly_turn_stable_yaw_reward": _masked_mean(reward, active).item(),
+            }
+        )
+    return reward
+
+
 def yaw_rate_progress_reward(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -280,6 +325,33 @@ def in_place_translation_penalty(
     )
     lin_vel_xy = env.scene["robot"].data.root_link_lin_vel_b[:, :2]
     penalty = torch.sum(torch.square(lin_vel_xy / max(float(velocity_scale), 1.0e-6)), dim=1)
+    if should_log_diagnostics(env, 64, attr_name="_se3_reward_log_interval_steps"):
+        speed = torch.linalg.vector_norm(lin_vel_xy, dim=1)
+        positive = active & (command[:, 1] > 0.0)
+        negative = active & (command[:, 1] < 0.0)
+        env.extras.setdefault("log", {}).update(
+            {
+                "Locomotion/flat_ly_turn_translation_speed": _masked_mean(speed, active).item(),
+                "Locomotion/flat_ly_turn_translation_speed_positive": _masked_mean(
+                    speed, positive
+                ).item(),
+                "Locomotion/flat_ly_turn_translation_speed_negative": _masked_mean(
+                    speed, negative
+                ).item(),
+                "Locomotion/flat_ly_turn_translation_vx_positive": _masked_mean(
+                    lin_vel_xy[:, 0], positive
+                ).item(),
+                "Locomotion/flat_ly_turn_translation_vx_negative": _masked_mean(
+                    lin_vel_xy[:, 0], negative
+                ).item(),
+                "Locomotion/flat_ly_turn_translation_vy_positive": _masked_mean(
+                    lin_vel_xy[:, 1], positive
+                ).item(),
+                "Locomotion/flat_ly_turn_translation_vy_negative": _masked_mean(
+                    lin_vel_xy[:, 1], negative
+                ).item(),
+            }
+        )
     return penalty * active.float()
 
 
@@ -1034,6 +1106,22 @@ def physical_stability_reward(
         if yaw_negative_mask.any()
         else torch.zeros((), device=env.device)
     )
+    # 课程只能由当前 yaw 上限附近的样本晋级，防止低速样本均值掩盖边界失稳。
+    command_term = env.command_manager.get_term(command_name)
+    yaw_range = getattr(command_term.cfg, "ang_vel_yaw_range", (-0.03, 0.03))
+    yaw_boundary = max(0.03, 0.8 * max(abs(float(yaw_range[0])), abs(float(yaw_range[1]))))
+    yaw_boundary_positive_mask = moving_mask & (command[:, 1] >= yaw_boundary)
+    yaw_boundary_negative_mask = moving_mask & (command[:, 1] <= -yaw_boundary)
+    yaw_boundary_positive_mean = (
+        per_env_course_score[yaw_boundary_positive_mask].mean()
+        if yaw_boundary_positive_mask.any()
+        else torch.zeros((), device=env.device)
+    )
+    yaw_boundary_negative_mean = (
+        per_env_course_score[yaw_boundary_negative_mask].mean()
+        if yaw_boundary_negative_mask.any()
+        else torch.zeros((), device=env.device)
+    )
     # 中高速课程必须让前进和后退分别达标，不能由样本更多或更容易的一侧掩盖另一侧。
     linear_positive_mask = moving_mask & (command[:, 0] > 0.03)
     linear_negative_mask = moving_mask & (command[:, 0] < -0.03)
@@ -1065,6 +1153,12 @@ def physical_stability_reward(
                 "Locomotion/flat_ly_course_yaw_tracking_score": yaw_course_mean.item(),
                 "Locomotion/flat_ly_course_yaw_positive_score": yaw_positive_mean.item(),
                 "Locomotion/flat_ly_course_yaw_negative_score": yaw_negative_mean.item(),
+                "Locomotion/flat_ly_course_yaw_boundary_positive_score": (
+                    yaw_boundary_positive_mean.item()
+                ),
+                "Locomotion/flat_ly_course_yaw_boundary_negative_score": (
+                    yaw_boundary_negative_mean.item()
+                ),
                 "Locomotion/flat_ly_course_linear_positive_score": linear_positive_mean.item(),
                 "Locomotion/flat_ly_course_linear_negative_score": linear_negative_mean.item(),
                 "Locomotion/flat_ly_standing_sample_ratio": standing_mask.float().mean().item(),
@@ -1090,6 +1184,13 @@ def physical_stability_reward(
                 .float()
                 .mean()
                 .item(),
+                "Locomotion/flat_ly_yaw_boundary_command": yaw_boundary,
+                "Locomotion/flat_ly_yaw_boundary_positive_sample_ratio": (
+                    yaw_boundary_positive_mask.float().mean().item()
+                ),
+                "Locomotion/flat_ly_yaw_boundary_negative_sample_ratio": (
+                    yaw_boundary_negative_mask.float().mean().item()
+                ),
             }
         )
     return reward
@@ -1450,12 +1551,17 @@ def configure_rewards(
             },
         )
         cfg.rewards["yaw_rate_precision"] = RewardTermCfg(
-            func=yaw_rate_precision_reward,
+            # 用联合正奖励替代单纯 yaw 精度奖励，避免靠大幅 roll/pitch 甩轮取巧。
+            func=stable_yaw_rate_tracking_reward,
             weight=4.0,
             params={
                 "command_name": "velocity_height",
                 "base_scale": 0.2,
                 "relative_scale": 0.08,
+                "pitch_scale_deg": 6.0,
+                "roll_scale_deg": 6.0,
+                "ang_vel_xy_scale": 0.8,
+                "min_command": 0.05,
             },
         )
         cfg.rewards["yaw_rate_progress"] = RewardTermCfg(
@@ -1474,8 +1580,9 @@ def configure_rewards(
             },
         )
         cfg.rewards["command_velocity_error"].weight = -2.0
+        # yaw 误差由 Huber + 联合稳定奖励负责；此通用项显式只保留线速度违令约束。
         cfg.rewards["command_velocity_error"].params.update(
-            {"yaw_vel_scale": 4.0, "max_penalty": 25.0}
+            {"include_yaw": False, "max_penalty": 25.0}
         )
         cfg.rewards["physical_stability"].params.update(
             {"yaw_score_base_scale": 0.2, "yaw_score_relative_scale": 0.08}

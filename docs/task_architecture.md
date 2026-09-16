@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `rough/` | `SE3-WheelLegged-Rough` | 崎岖地形行走任务 |
 | `flat/` | `SE3-WheelLegged-Flat-GRU` | 平地行走 GRU 基模 |
-| `flat_ly/` | `SE3-WheelLegged-Flat-LY-GRU`、`*-Stand-GRU`、`*-Turn-GRU`、`*-Arc-GRU` | 从随机初始化 base 开始的静站、转向与弧线平地训练流水线 |
+| `flat_ly/` | `SE3-WheelLegged-Flat-LY-GRU`、`*-Speed-GRU`、`*-Stand-GRU`、`*-Turn-GRU`、`*-Arc-GRU` | 平地随机 base、双向速度、静站、yaw 转向与弧线训练阶段 |
 | `recovery/` | `SE3-WheelLegged-Recovery-GRU` | 倒地自启任务，从平地 GRU checkpoint warm start |
 | `recovery_discovery/` | `SE3-WheelLegged-Recovery-Discovery-GRU` | 倒地自启 discovery 阶段，从 recovery 配置派生 |
 | `recovery_finetune/` | `SE3-WheelLegged-Recovery-FineTune-GRU` | 倒地自启 fine-tune 阶段，使用台阶/恢复状态缓存继续训练 |
@@ -23,7 +23,9 @@
 ## flat_ly 学习任务
 
 `flat_ly/` 保持 34D actor 观测和 6D 动作契约，提供随机初始化 base，以及
-stand、turn、arc 三个只加载 actor/critic 的 warm-start 阶段。静站指令项维护
+speed、stand、turn、arc 四个只加载 actor/critic 的 warm-start 阶段。推荐先完成
+双向 speed，再从该 checkpoint 进入 turn；turn 课程分开采样原地 yaw 和低速直行，
+由正负 yaw 边界分数、静站和直行护栏共同控制晋级。静站指令项维护
 位置/yaw 锚点外环，奖励同时约束累计位姿漂移与回零后的低频速度偏置；外环主动
 纠偏期间不施加严格零速惩罚。任务使用独立的
 `logs/rsl_rl/se3_wheel_leg_flat_ly/` 实验目录。完整 fresh 训练顺序和命令见

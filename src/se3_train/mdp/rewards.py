@@ -702,8 +702,9 @@ def command_velocity_error(
     lin_deadband: float = 0.05,
     yaw_deadband: float = 0.10,
     max_penalty: float = 9.0,
+    include_yaw: bool = True,
 ) -> torch.Tensor:
-    """惩罚平地速度违令，避免 exp 跟踪奖励在大误差时变成无梯度零奖励。"""
+    """惩罚平地速度违令，可显式关闭已由专属项处理的 yaw 通道。"""
     robot = env.scene["robot"]
     cmd = env.command_manager.get_command(command_name)
     jump_flag = (
@@ -717,7 +718,9 @@ def command_velocity_error(
     yaw_error = torch.abs(robot.data.root_link_ang_vel_b[:, 2] - cmd[:, 1])
     lin_excess = torch.clamp(lin_error - float(lin_deadband), min=0.0)
     yaw_excess = torch.clamp(yaw_error - float(yaw_deadband), min=0.0)
-    penalty = (lin_excess / float(lin_vel_scale)) ** 2 + (yaw_excess / float(yaw_vel_scale)) ** 2
+    penalty = (lin_excess / float(lin_vel_scale)) ** 2
+    if include_yaw:
+        penalty = penalty + (yaw_excess / float(yaw_vel_scale)) ** 2
     penalty = torch.clamp(penalty, max=float(max_penalty)) * active.float()
 
     if hasattr(env, "extras") and isinstance(env.extras.get("log"), dict) and _should_log_step(env):

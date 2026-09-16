@@ -44,6 +44,13 @@ def rl_cfg(
         cfg.algorithm.learning_rate = 5.0e-5
         cfg.algorithm.entropy_coef = 1.0e-3
         cfg.algorithm.desired_kl = 0.006
+    if phase in {"turn", "arc"}:
+        # yaw 阶段从已稳定 checkpoint warm-start，重新探索必须小于随机初始化 base。
+        cfg.algorithm.class_name = "se3_train.tasks.flat_ly.ppo:FlatLyTurnPPO"
+        cfg.actor.distribution_cfg["init_std"] = 0.15
+        cfg.algorithm.learning_rate = 6.0e-5
+        cfg.algorithm.entropy_coef = 1.5e-3
+        cfg.algorithm.desired_kl = 0.006
     if smoke or os.environ.get("SE3_SMOKE", "0") == "1":
         # 单环境 smoke 不能切成 4 个 mini-batch，否则 RSL-RL 会生成空批次并产生 NaN。
         cfg.algorithm.num_mini_batches = 1

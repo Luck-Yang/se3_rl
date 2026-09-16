@@ -18,8 +18,15 @@ _COURSE_EMA_ATTR = "_flat_ly_physical_course_ema"
 _STAGE_START_STEP_ATTR = "_flat_ly_physical_stage_start_step"
 _YAW_MAX_ATTR = "_flat_ly_physical_yaw_max"
 _YAW_EMA_ATTR = "_flat_ly_physical_yaw_ema"
+_YAW_STANDING_EMA_ATTR = "_flat_ly_yaw_standing_ema"
+_YAW_LINEAR_GUARD_EMA_ATTR = "_flat_ly_yaw_linear_guard_ema"
 _YAW_STAGE_START_STEP_ATTR = "_flat_ly_physical_yaw_stage_start_step"
 _YAW_STAGE_INDEX_ATTR = "_flat_ly_yaw_stage_index"
+_YAW_POSITIVE_SCORE_ATTR = "_flat_ly_yaw_positive_score"
+_YAW_NEGATIVE_SCORE_ATTR = "_flat_ly_yaw_negative_score"
+_YAW_STANDING_SCORE_ATTR = "_flat_ly_yaw_standing_score"
+_YAW_LINEAR_POSITIVE_SCORE_ATTR = "_flat_ly_yaw_linear_positive_score"
+_YAW_LINEAR_NEGATIVE_SCORE_ATTR = "_flat_ly_yaw_linear_negative_score"
 _SPEED_STAGE_INDEX_ATTR = "_flat_ly_speed_stage_index"
 _SPEED_EMA_ATTR = "_flat_ly_speed_course_ema"
 _SPEED_STANDING_EMA_ATTR = "_flat_ly_speed_standing_ema"
@@ -148,11 +155,13 @@ def commands_yaw_staged(
     command_name: str,
     yaw_stages: tuple[float, ...],
     advance_threshold: float = 0.60,
+    standing_guard_threshold: float = 0.25,
+    linear_guard_threshold: float = 0.35,
     ema_alpha: float = 0.05,
     min_stage_iterations: int = 200,
     steps_per_policy_iter: int = 64,
 ) -> dict[str, torch.Tensor]:
-    """正负方向同时达标后，按显式档位逐步扩大高速 yaw-rate。"""
+    """正负边界 yaw、静站和双向直行同时达标后，逐档扩大 yaw-rate。"""
     del env_ids
     term = env.command_manager.get_term(command_name)
     cfg: VelocityHeightCommandCfg = term.cfg  # type: ignore[assignment]
@@ -164,10 +173,19 @@ def commands_yaw_staged(
     if not hasattr(env, _YAW_STAGE_INDEX_ATTR):
         setattr(env, _YAW_STAGE_INDEX_ATTR, 0)
         setattr(env, _YAW_EMA_ATTR, 0.0)
+        setattr(env, _YAW_STANDING_EMA_ATTR, 0.0)
+        setattr(env, _YAW_LINEAR_GUARD_EMA_ATTR, 0.0)
         setattr(env, _YAW_STAGE_START_STEP_ATTR, common_step)
+        setattr(env, _YAW_POSITIVE_SCORE_ATTR, float("nan"))
+        setattr(env, _YAW_NEGATIVE_SCORE_ATTR, float("nan"))
+        setattr(env, _YAW_STANDING_SCORE_ATTR, float("nan"))
+        setattr(env, _YAW_LINEAR_POSITIVE_SCORE_ATTR, float("nan"))
+        setattr(env, _YAW_LINEAR_NEGATIVE_SCORE_ATTR, float("nan"))
 
     stage_index = min(int(getattr(env, _YAW_STAGE_INDEX_ATTR)), len(stages) - 1)
     yaw_ema = float(getattr(env, _YAW_EMA_ATTR))
+    standing_ema = float(getattr(env, _YAW_STANDING_EMA_ATTR))
+    linear_guard_ema = float(getattr(env, _YAW_LINEAR_GUARD_EMA_ATTR))
     stage_start_step = int(getattr(env, _YAW_STAGE_START_STEP_ATTR))
     min_stage_steps = max(0, int(min_stage_iterations)) * max(1, int(steps_per_policy_iter))
     dwell_progress = min(
@@ -176,26 +194,63 @@ def commands_yaw_staged(
     )
 
     log = getattr(env, "extras", {}).get("log", {})
-    positive_score = log.get("Locomotion/flat_ly_course_yaw_positive_score")
-    negative_score = log.get("Locomotion/flat_ly_course_yaw_negative_score")
-    if positive_score is not None and negative_score is not None:
-        physical_score = min(float(positive_score), float(negative_score))
+    positive_score = log.get("Locomotion/flat_ly_course_yaw_boundary_positive_score")
+    negative_score = log.get("Locomotion/flat_ly_course_yaw_boundary_negative_score")
+    standing_score = log.get("Locomotion/flat_ly_course_standing_score")
+    linear_positive_score = log.get("Locomotion/flat_ly_course_linear_positive_score")
+    linear_negative_score = log.get("Locomotion/flat_ly_course_linear_negative_score")
+    if all(
+        score is not None
+        for score in (
+            positive_score,
+            negative_score,
+            standing_score,
+            linear_positive_score,
+            linear_negative_score,
+        )
+    ):
+        positive_score = float(positive_score)
+        negative_score = float(negative_score)
+        standing_score = float(standing_score)
+        linear_positive_score = float(linear_positive_score)
+        linear_negative_score = float(linear_negative_score)
+        setattr(env, _YAW_POSITIVE_SCORE_ATTR, positive_score)
+        setattr(env, _YAW_NEGATIVE_SCORE_ATTR, negative_score)
+        setattr(env, _YAW_STANDING_SCORE_ATTR, standing_score)
+        setattr(env, _YAW_LINEAR_POSITIVE_SCORE_ATTR, linear_positive_score)
+        setattr(env, _YAW_LINEAR_NEGATIVE_SCORE_ATTR, linear_negative_score)
+        physical_score = min(positive_score, negative_score)
+        linear_guard_score = min(linear_positive_score, linear_negative_score)
         alpha = min(max(float(ema_alpha), 0.0), 1.0)
         yaw_ema = (1.0 - alpha) * yaw_ema + alpha * physical_score
+        standing_ema = (1.0 - alpha) * standing_ema + alpha * standing_score
+        linear_guard_ema = (1.0 - alpha) * linear_guard_ema + alpha * linear_guard_score
         if (
             yaw_ema > float(advance_threshold)
+            and standing_ema > float(standing_guard_threshold)
+            and linear_guard_ema > float(linear_guard_threshold)
             and dwell_progress >= 1.0
             and stage_index < len(stages) - 1
         ):
             stage_index += 1
             yaw_ema = 0.0
+            standing_ema = 0.0
+            linear_guard_ema = 0.0
             stage_start_step = common_step
             dwell_progress = 0.0
         setattr(env, _YAW_STAGE_INDEX_ATTR, stage_index)
         setattr(env, _YAW_EMA_ATTR, yaw_ema)
+        setattr(env, _YAW_STANDING_EMA_ATTR, standing_ema)
+        setattr(env, _YAW_LINEAR_GUARD_EMA_ATTR, linear_guard_ema)
         setattr(env, _YAW_STAGE_START_STEP_ATTR, stage_start_step)
     else:
-        physical_score = float("nan")
+        positive_score = float(getattr(env, _YAW_POSITIVE_SCORE_ATTR))
+        negative_score = float(getattr(env, _YAW_NEGATIVE_SCORE_ATTR))
+        standing_score = float(getattr(env, _YAW_STANDING_SCORE_ATTR))
+        linear_positive_score = float(getattr(env, _YAW_LINEAR_POSITIVE_SCORE_ATTR))
+        linear_negative_score = float(getattr(env, _YAW_LINEAR_NEGATIVE_SCORE_ATTR))
+        physical_score = min(positive_score, negative_score)
+        linear_guard_score = min(linear_positive_score, linear_negative_score)
 
     yaw_max = stages[stage_index]
     cfg.ang_vel_yaw_range = (-yaw_max, yaw_max)
@@ -203,8 +258,16 @@ def commands_yaw_staged(
         "ang_vel_yaw_max": torch.tensor(yaw_max, device=env.device),
         "yaw_stage_index": torch.tensor(float(stage_index), device=env.device),
         "yaw_ema": torch.tensor(yaw_ema, device=env.device),
+        "yaw_standing_guard_ema": torch.tensor(standing_ema, device=env.device),
+        "yaw_linear_guard_ema": torch.tensor(linear_guard_ema, device=env.device),
         "yaw_stage_dwell_progress": torch.tensor(dwell_progress, device=env.device),
         "yaw_physical_score": torch.tensor(physical_score, device=env.device),
+        "yaw_positive_score": torch.tensor(positive_score, device=env.device),
+        "yaw_negative_score": torch.tensor(negative_score, device=env.device),
+        "yaw_standing_guard_score": torch.tensor(standing_score, device=env.device),
+        "yaw_linear_guard_score": torch.tensor(linear_guard_score, device=env.device),
+        "yaw_linear_positive_score": torch.tensor(linear_positive_score, device=env.device),
+        "yaw_linear_negative_score": torch.tensor(linear_negative_score, device=env.device),
     }
 
 
@@ -340,8 +403,11 @@ def configure_curriculums(
         command_vel_cfg.params.update(
             {
                 "command_name": "velocity_height",
-                "yaw_stages": (0.3, 0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0),
+                # 6 rad/s 时每侧轮速约 22 rad/s，仍为倒立平衡保留约一半轮速余量。
+                "yaw_stages": (0.3, 0.5, 0.8, 1.2, 1.8, 2.5, 3.5, 4.5, 6.0),
                 "advance_threshold": 0.60,
+                "standing_guard_threshold": 0.25,
+                "linear_guard_threshold": 0.35,
                 "ema_alpha": 0.05,
                 "min_stage_iterations": 200 if phase == "turn" else 50,
                 "steps_per_policy_iter": 64,

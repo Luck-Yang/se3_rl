@@ -437,7 +437,7 @@ def configure_commands(
     cfg.commands["velocity_height"] = command_cfg
     command_cfg.pitch_range = (0.0, 0.0)
     command_cfg.roll_range = (0.0, 0.0)
-    # 使用真实轮距和轮半径；0.98 的轮速预算刚好覆盖 12 rad/s 原地旋转。
+    # 使用真实轮距和轮半径；指令包络不得占满轮速，倒立平衡还需要共同轮速余量。
     command_cfg.constrain_diff_drive_commands = True
     command_cfg.diff_drive_wheel_radius = 0.059
     command_cfg.diff_drive_half_track = 0.21665
@@ -466,12 +466,14 @@ def configure_commands(
         command_cfg.lin_vel_x_range = (-0.2, 0.2)
         command_cfg.ang_vel_yaw_range = (-0.1, 0.1)
     elif phase == "turn":
-        command_cfg.standing_ratio = 0.30
-        command_cfg.straight_motion_ratio = 0.2142857143
-        command_cfg.yaw_only_ratio = 0.7857142857
-        command_cfg.lin_vel_x_range = (-2.0, 2.0)
-        command_cfg.ang_vel_yaw_range = (-0.3, 0.3)
-        command_cfg.yaw_vel_slew_rate = None if play else 6.0
+        # 先单独学习绕自身中心转向：25% 静站、约 56% 原地 yaw、约 19% 低速直行护栏。
+        # 高速前后运动留给 speed/arc，避免 yaw 第一档直接与 ±2 m/s 同时耦合。
+        command_cfg.standing_ratio = 0.25
+        command_cfg.straight_motion_ratio = 0.25
+        command_cfg.yaw_only_ratio = 0.75
+        command_cfg.lin_vel_x_range = (-0.3, 0.3)
+        command_cfg.ang_vel_yaw_range = (-6.0, 6.0) if play else (-0.3, 0.3)
+        command_cfg.yaw_vel_slew_rate = None if play else 3.0
         command_cfg.stratified_yaw_sampling = True
         command_cfg.resampling_time_range = (8.0, 8.0)
     elif phase == "arc":
@@ -479,7 +481,7 @@ def configure_commands(
         command_cfg.straight_motion_ratio = 1.0 / 3.0
         command_cfg.yaw_only_ratio = 1.0 / 3.0
         command_cfg.lin_vel_x_range = (-2.0, 2.0)
-        command_cfg.ang_vel_yaw_range = (-0.3, 0.3)
+        command_cfg.ang_vel_yaw_range = (-6.0, 6.0) if play else (-0.3, 0.3)
         command_cfg.yaw_vel_slew_rate = None if play else 6.0
         command_cfg.stratified_yaw_sampling = True
         command_cfg.resampling_time_range = (8.0, 8.0)

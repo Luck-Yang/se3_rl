@@ -115,9 +115,16 @@ class FlatLySpeedPPO(FlatLyBoundedPPO):
     max_learning_rate = 1.0e-4
 
 
+class FlatLyTurnPPO(FlatLyBoundedPPO):
+    """限制 yaw warm-start 的更新幅度，保护已有双向速度与姿态能力。"""
+
+    max_learning_rate = 8.0e-5
+
+
 __all__ = [
     "FlatLyBasePPO",
     "FlatLyBoundedPPO",
     "FlatLyFineTunePPO",
     "FlatLySpeedPPO",
+    "FlatLyTurnPPO",
 ]
